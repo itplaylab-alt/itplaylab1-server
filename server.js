@@ -84,7 +84,7 @@ function getSheetsClient() {
 
 async function appendRows(rows) {
   const sheets = getSheetsClient();
-  const range = `${EVENTS_SHEET_NAME}!A:E`;
+  const range = `${EVENTS_SHEET_NAME}!A1`;
 
   await sheets.spreadsheets.values.append({
     spreadsheetId: SHEET_ID,
