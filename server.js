@@ -250,3 +250,10 @@ app.post("/events", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 server listening on ${PORT}`);
 });
+
+console.log("[ENV CHECK]", {
+  b64_len: (process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "").length,
+  b64_trim_len: (process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "").trim().length,
+});
+
+
