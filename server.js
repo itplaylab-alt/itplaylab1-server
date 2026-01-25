@@ -255,5 +255,11 @@ console.log("[ENV CHECK]", {
   b64_len: (process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "").length,
   b64_trim_len: (process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "").trim().length,
 });
+console.log("[ENV CHECK2]", {
+  sheet_id_len: (SHEET_ID || "").length,
+  sheet_id_prefix: (SHEET_ID || "").slice(0, 8),
+  sheet_name: EVENTS_SHEET_NAME,
+});
+
 
 
