@@ -238,14 +238,24 @@ app.post("/events", async (req, res) => {
       latency_ms: Date.now() - t0,
     });
   } catch (e) {
-    console.error("[/events] error:", e?.message || e);
-    return res.status(500).json({
-      ok: false,
-      error: "INTERNAL_ERROR",
-      detail: e?.message || String(e),
-    });
-  }
-});
+  const status = e?.response?.status || null;
+  const g = e?.response?.data?.error || null; // googleapis 표준 에러 포맷
+
+  console.error("[/events] error:", {
+    message: e?.message || String(e),
+    status,
+    g_message: g?.message,
+    g_status: g?.status,
+    g_errors: g?.errors, // reason/domain/message 등이 들어있음
+  });
+
+  return res.status(500).json({
+    ok: false,
+    error: "INTERNAL_ERROR",
+    detail: g?.message || e?.message || String(e),
+  });
+}
+
 
 app.listen(PORT, () => {
   console.log(`🚀 server listening on ${PORT}`);
