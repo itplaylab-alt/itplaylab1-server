@@ -1,275 +1,76 @@
-// server.js — ItplayLab v7.6+ events-ingest (Render, CommonJS)
-// - POST /events : supports {events:[...]} and legacy TSV {action, lines}
-// - Dedup by event_id (DEDUPE_WINDOW)
-// - Append rows to Google Sheets (Service Account JSON B64)
+// v7.6-OPS-DOWN:ECHO (LOCK)
+// external dependencies hard-OFF: no Google/GAS/Sheets import, no init, no calls.
 
 const express = require("express");
-const crypto = require("crypto");
-const { google } = require("googleapis");
 
 const app = express();
-app.use(express.json({ limit: "5mb" }));
+app.disable("x-powered-by");
 
-// ---------------------------
-// Env
-// ---------------------------
-const PORT = process.env.PORT || 3000;
-const SHEET_ID = process.env.SHEET_ID;
-const EVENTS_SHEET_NAME = process.env.EVENTS_SHEET_NAME || "events";
-const DEDUPE_WINDOW = Number(process.env.DEDUPE_WINDOW || 2000);
+// Body parser: 규칙화 (필요시 JSON_LIMIT로 조절)
+app.use(
+  express.json({
+    limit: process.env.JSON_LIMIT || "2mb",
+    type: ["application/json", "*/json", "+json"],
+  })
+);
 
-// ✅ Render에는 이걸 넣었지
-const SA_B64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "";
+const OPS_MODE = "ECHO"; // 락 목적: 하드고정 추천
+const MODE_TAG = `v7.6-OPS-DOWN:${OPS_MODE}`;
 
-// (하위호환) 혹시 B64 대신 JSON 문자열로 넣고 싶으면 이걸 사용해도 됨
-const SA_JSON_PLAIN = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "";
-
-if (!SHEET_ID) console.warn("[WARN] SHEET_ID missing");
-if (!EVENTS_SHEET_NAME) console.warn("[WARN] EVENTS_SHEET_NAME missing");
-if (!SA_B64 && !SA_JSON_PLAIN)
-  console.warn("[WARN] GOOGLE_SERVICE_ACCOUNT_JSON_B64 / GOOGLE_SERVICE_ACCOUNT_JSON missing");
-
-// ---------------------------
-// Utils
-// ---------------------------
-const nowISO = () => new Date().toISOString();
-const rand4 = () => crypto.randomBytes(2).toString("hex");
-
-function genEventId({ source = "unknown", user_id = "anonymous" } = {}) {
-  return `evt_${source}_${user_id}_${Date.now()}_${rand4()}`;
-}
-
-// ---------------------------
-// Deduper (in-memory)
-// ---------------------------
-const seen = new Set();
-const queue = [];
-
-function isDup(event_id) {
-  if (!event_id) return false;
-  if (seen.has(event_id)) return true;
-
-  seen.add(event_id);
-  queue.push(event_id);
-
-  if (queue.length > DEDUPE_WINDOW) {
-    const old = queue.shift();
-    if (old) seen.delete(old);
-  }
-  return false;
-}
-
-// ---------------------------
-// Google Sheets client
-// ---------------------------
-function getServiceAccountCreds() {
-  if (SA_JSON_PLAIN) {
-    return JSON.parse(SA_JSON_PLAIN);
-  }
-  if (SA_B64) {
-    const jsonText = Buffer.from(SA_B64, "base64").toString("utf8");
-    return JSON.parse(jsonText);
-  }
-  throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_JSON_B64 (or GOOGLE_SERVICE_ACCOUNT_JSON)");
-}
-
-function getSheetsClient() {
-  const creds = getServiceAccountCreds();
-  const auth = new google.auth.GoogleAuth({
-    credentials: creds,
-    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-  });
-  return google.sheets({ version: "v4", auth });
-}
-
-async function appendRows(rows) {
-  const sheets = getSheetsClient();
-  const range = `${EVENTS_SHEET_NAME}!A1`;
-
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: SHEET_ID,
-    range,
-    valueInputOption: "RAW",
-    insertDataOption: "INSERT_ROWS",
-    requestBody: { values: rows },
-  });
-}
-
-// ---------------------------
-// Payload pack v1 (Sheets B열)
-// ---------------------------
-function packPayloadV1({ event_type, occurred_at, source, user_id, data, raw, req }) {
-  const ip =
-    (req.headers["x-forwarded-for"] || "").toString().split(",")[0].trim() ||
-    req.socket?.remoteAddress ||
-    null;
-
-  const ua = req.headers["user-agent"] || null;
-
-  return {
-    v: 1,
-    event_type: event_type || "unknown",
-    occurred_at: occurred_at || null,
-    meta: {
-      source: source || "unknown",
-      user_id: user_id || "anonymous",
-      ip,
-      ua,
-    },
-    data: data ?? null,
-    raw: raw ?? null,
-  };
-}
-
-// ---------------------------
-// Routes
-// ---------------------------
 app.get("/health", (req, res) => {
-  res.json({ ok: true, service: "itplaylab-events-ingest" });
+  res.status(200).json({
+    ok: true,
+    service: "itplaylab-events-ingest",
+    mode: MODE_TAG,
+  });
 });
 
-app.post("/events", async (req, res) => {
-  const t0 = Date.now();
+let receivedCount = 0;
 
-  try {
-    const body = req.body || {};
-    const received_at = nowISO();
+app.post("/events", (req, res) => {
+  receivedCount += 1;
 
-    let received = 0;
-    let appended = 0;
-    let dropped_duplicates = 0;
+  const body = req.body ?? {};
+  const raw = JSON.stringify(body);
+  const bytes = Buffer.byteLength(raw, "utf8");
 
-    const rows = [];
+  // payload 전체 로그 금지(민감/로그폭발) — bytes만
+  console.log("[/events] echo received", { n: receivedCount, bytes, mode: MODE_TAG });
 
-    // ✅ Legacy TSV: { action:"append_events_tsv", lines:["evt...\t{...json...}"] }
-    if (body.action === "append_events_tsv" && Array.isArray(body.lines)) {
-      for (const line of body.lines) {
-        if (!line || typeof line !== "string") continue;
-        received++;
-
-        const [event_id_raw, payload_raw = ""] = line.split("\t");
-        const source = String(body.source || "legacy");
-        const user_id = String(body.user_id || "anonymous");
-        const event_id = (event_id_raw || "").trim() || genEventId({ source, user_id });
-
-        if (isDup(event_id)) {
-          dropped_duplicates++;
-          continue;
-        }
-
-        let data = null;
-        try {
-          data = payload_raw ? JSON.parse(payload_raw) : { raw_line: line };
-        } catch {
-          data = { raw_line: line };
-        }
-
-        const packed = packPayloadV1({
-          event_type: "legacy.tsv",
-          occurred_at: null,
-          source,
-          user_id,
-          data,
-          raw: { line },
-          req,
-        });
-
-        rows.push([event_id, JSON.stringify(packed), received_at, source, user_id]);
-        appended++;
-      }
-
-      if (rows.length > 0) await appendRows(rows);
-
-      return res.json({
-        ok: true,
-        received,
-        appended,
-        dropped_duplicates,
-        latency_ms: Date.now() - t0,
-      });
-    }
-
-    // ✅ Standard JSON: { events:[ {event_id?, event_type?, source?, user_id?, occurred_at?, payload?} ] }
-    const events = Array.isArray(body.events) ? body.events : null;
-    if (!events) {
-      return res.status(400).json({
-        ok: false,
-        error: "BAD_REQUEST",
-        detail: "Use {events:[...]} or legacy {action:'append_events_tsv', lines:[...]}",
-      });
-    }
-
-    for (const ev of events) {
-      if (!ev || typeof ev !== "object") continue;
-      received++;
-
-      const source = String(ev.source || body.source || "unknown");
-      const user_id = String(ev.user_id || body.user_id || "anonymous");
-      const event_type = String(ev.event_type || "unknown");
-      const occurred_at = ev.occurred_at ? String(ev.occurred_at) : null;
-      const event_id = String(ev.event_id || genEventId({ source, user_id }));
-
-      if (isDup(event_id)) {
-        dropped_duplicates++;
-        continue;
-      }
-
-      const packed = packPayloadV1({
-        event_type,
-        occurred_at,
-        source,
-        user_id,
-        data: ev.payload ?? null,
-        raw: ev,
-        req,
-      });
-
-      rows.push([event_id, JSON.stringify(packed), received_at, source, user_id]);
-      appended++;
-    }
-
-    if (rows.length > 0) await appendRows(rows);
-
-    return res.json({
-      ok: true,
-      received,
-      appended,
-      dropped_duplicates,
-      latency_ms: Date.now() - t0,
-    });
-  } catch (e) {
-  const status = e?.response?.status || null;
-  const g = e?.response?.data?.error || null; // googleapis 표준 에러 포맷
-
-  console.error("[/events] error:", {
-    message: e?.message || String(e),
-    status,
-    g_message: g?.message,
-    g_status: g?.status,
-    g_errors: g?.errors, // reason/domain/message 등이 들어있음
+  return res.status(200).json({
+    ok: true,
+    mode: MODE_TAG,
+    received_count: receivedCount,
+    bytes,
   });
+});
 
-  return res.status(500).json({
+// 404도 JSON 고정
+app.use((req, res) => {
+  res.status(404).json({
     ok: false,
-    error: "INTERNAL_ERROR",
-    detail: g?.message || e?.message || String(e),
+    error: "NOT_FOUND",
+    detail: "Route not found",
+    mode: MODE_TAG,
   });
-}
+});
 
+// 전역 에러 핸들러: INVALID_JSON/413 포함 항상 JSON
+app.use((err, req, res, next) => {
+  const msg = err?.message || String(err);
+  const status = err?.statusCode || err?.status || 400;
 
+  console.error("[global-error]", { status, msg, mode: MODE_TAG });
+
+  res.status(status).json({
+    ok: false,
+    error: status === 413 ? "PAYLOAD_TOO_LARGE" : "INVALID_REQUEST",
+    detail: msg,
+    mode: MODE_TAG,
+  });
+});
+
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 server listening on ${PORT}`);
+  console.log(`server listening on ${PORT} (mode=${MODE_TAG}, external=OFF)`);
 });
-
-console.log("[ENV CHECK]", {
-  b64_len: (process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "").length,
-  b64_trim_len: (process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "").trim().length,
-});
-console.log("[ENV CHECK2]", {
-  sheet_id_len: (SHEET_ID || "").length,
-  sheet_id_prefix: (SHEET_ID || "").slice(0, 8),
-  sheet_name: EVENTS_SHEET_NAME,
-});
-
-
-
