@@ -31,6 +31,101 @@ const crypto = require("crypto");
 const app = express();
 app.disable("x-powered-by");
 
+// ------------------------------
+// Line 2: INGEST (order intake)
+// ------------------------------
+app.post("/ingest", express.json({ limit: "2mb" }), (req, res) => {
+  const start = Date.now();
+  const traceId =
+    req.headers["x-request-id"] ||
+    crypto.randomUUID();
+
+  try {
+    const { source, event_type, payload } = req.body || {};
+
+    if (!source || !event_type || !payload) {
+      const latency = Date.now() - start;
+      console.warn(JSON.stringify({
+        ts: new Date().toISOString(),
+        level: "WARN",
+        line: "L2",
+        event: "ingest.reject",
+        trace_id: traceId,
+        ok: false,
+        error: "BAD_REQUEST",
+        latency_ms: latency
+      }));
+
+      return res.status(400).json({
+        ok: false,
+        error: "BAD_REQUEST",
+        detail: "source,event_type,payload are required",
+        trace_id: traceId,
+        mode: "v7.9-OPS-L2"
+      });
+    }
+
+    const jobId =
+      "job_" +
+      new Date().toISOString().replace(/[-:.TZ]/g, "") +
+      "_" +
+      crypto.randomBytes(3).toString("hex");
+
+    const latency = Date.now() - start;
+
+    console.log(JSON.stringify({
+      ts: new Date().toISOString(),
+      level: "INFO",
+      line: "L2",
+      event: "ingest.received",
+      trace_id: traceId,
+      source,
+      event_type
+    }));
+
+    console.log(JSON.stringify({
+      ts: new Date().toISOString(),
+      level: "INFO",
+      line: "L2",
+      event: "ingest.ack",
+      trace_id: traceId,
+      job_id: jobId,
+      ok: true,
+      latency_ms: latency
+    }));
+
+    return res.status(200).json({
+      ok: true,
+      job_id: jobId,
+      trace_id: traceId,
+      received_at: new Date().toISOString(),
+      latency_ms: latency,
+      mode: "v7.9-OPS-L2"
+    });
+
+  } catch (err) {
+    const latency = Date.now() - start;
+    console.error(JSON.stringify({
+      ts: new Date().toISOString(),
+      level: "ERROR",
+      line: "L2",
+      event: "ingest.fail",
+      trace_id: traceId,
+      ok: false,
+      error: err.message,
+      latency_ms: latency
+    }));
+
+    return res.status(500).json({
+      ok: false,
+      error: "INTERNAL",
+      trace_id: traceId,
+      mode: "v7.9-OPS-L2"
+    });
+  }
+});
+
+
 // -----------------------
 // Config
 // -----------------------
