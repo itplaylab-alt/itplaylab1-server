@@ -24,107 +24,16 @@
 // - WORKER_BATCH_SIZE=5
 // - WORKER_MAX_RETRY=5
 // - WORKER_BACKOFF_BASE_MS=2000
+//
+// Line 3-A (NEW):
+// - GAS_WEBAPP_URL (required for /ingest -> Sheets append)
+// - ITPLAYLAB_SECRET (shared secret; must match GAS Script Properties)
 
 const express = require("express");
 const crypto = require("crypto");
 
 const app = express();
 app.disable("x-powered-by");
-
-// ------------------------------
-// Line 2: INGEST (order intake)
-// ------------------------------
-app.post("/ingest", express.json({ limit: "2mb" }), (req, res) => {
-  const start = Date.now();
-  const traceId =
-    req.headers["x-request-id"] ||
-    crypto.randomUUID();
-
-  try {
-    const { source, event_type, payload } = req.body || {};
-
-    if (!source || !event_type || !payload) {
-      const latency = Date.now() - start;
-      console.warn(JSON.stringify({
-        ts: new Date().toISOString(),
-        level: "WARN",
-        line: "L2",
-        event: "ingest.reject",
-        trace_id: traceId,
-        ok: false,
-        error: "BAD_REQUEST",
-        latency_ms: latency
-      }));
-
-      return res.status(400).json({
-        ok: false,
-        error: "BAD_REQUEST",
-        detail: "source,event_type,payload are required",
-        trace_id: traceId,
-        mode: "v7.9-OPS-L2"
-      });
-    }
-
-    const jobId =
-      "job_" +
-      new Date().toISOString().replace(/[-:.TZ]/g, "") +
-      "_" +
-      crypto.randomBytes(3).toString("hex");
-
-    const latency = Date.now() - start;
-
-    console.log(JSON.stringify({
-      ts: new Date().toISOString(),
-      level: "INFO",
-      line: "L2",
-      event: "ingest.received",
-      trace_id: traceId,
-      source,
-      event_type
-    }));
-
-    console.log(JSON.stringify({
-      ts: new Date().toISOString(),
-      level: "INFO",
-      line: "L2",
-      event: "ingest.ack",
-      trace_id: traceId,
-      job_id: jobId,
-      ok: true,
-      latency_ms: latency
-    }));
-
-    return res.status(200).json({
-      ok: true,
-      job_id: jobId,
-      trace_id: traceId,
-      received_at: new Date().toISOString(),
-      latency_ms: latency,
-      mode: "v7.9-OPS-L2"
-    });
-
-  } catch (err) {
-    const latency = Date.now() - start;
-    console.error(JSON.stringify({
-      ts: new Date().toISOString(),
-      level: "ERROR",
-      line: "L2",
-      event: "ingest.fail",
-      trace_id: traceId,
-      ok: false,
-      error: err.message,
-      latency_ms: latency
-    }));
-
-    return res.status(500).json({
-      ok: false,
-      error: "INTERNAL",
-      trace_id: traceId,
-      mode: "v7.9-OPS-L2"
-    });
-  }
-});
-
 
 // -----------------------
 // Config
@@ -145,18 +54,23 @@ const WORKER_BATCH_SIZE = Number(process.env.WORKER_BATCH_SIZE || 5);
 const WORKER_MAX_RETRY = Number(process.env.WORKER_MAX_RETRY || 5);
 const WORKER_BACKOFF_BASE_MS = Number(process.env.WORKER_BACKOFF_BASE_MS || 2000);
 
-// Google settings (used ONLY when syncing)
+// Google settings (used ONLY when syncing for /events worker)
 const SHEET_ID = process.env.SHEET_ID || "";
 const EVENTS_SHEET_NAME = process.env.EVENTS_SHEET_NAME || "events";
 const SA_B64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON_B64 || "";
 const SA_JSON_PLAIN = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "";
+
+// Line 3-A settings (/ingest -> GAS -> Sheets)
+const GAS_WEBAPP_URL = process.env.GAS_WEBAPP_URL || "";
+const ITPLAYLAB_SECRET = process.env.ITPLAYLAB_SECRET || "";
+const GAS_TIMEOUT_MS = Number(process.env.GAS_TIMEOUT_MS || 2500);
 
 // Derived switches
 const STORE_ENABLED = OPS_MODE === "STORE" || OPS_MODE === "FULL";
 const WORKER_ENABLED = OPS_MODE === "FULL" && EXTERNAL_SYNC === "ON";
 
 // -----------------------
-// Body parser
+// Body parser (global)
 // -----------------------
 app.use(
   express.json({
@@ -181,6 +95,218 @@ function cleanupMapByWindow(map, now, windowMs) {
     if (now - ts > windowMs) map.delete(k);
   }
 }
+
+// ---- Line 3-A helper: POST to GAS (best-effort, timeout, never throws outward)
+async function postToGASForSheets(eventForSheets) {
+  if (!GAS_WEBAPP_URL || !ITPLAYLAB_SECRET) {
+    return { ok: false, error: "missing_GAS_WEBAPP_URL_or_ITPLAYLAB_SECRET" };
+  }
+
+  const endpoint = `${GAS_WEBAPP_URL}?__secret=${encodeURIComponent(ITPLAYLAB_SECRET)}`;
+  const t0 = Date.now();
+
+  // Node 18+ fetch + AbortController
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), GAS_TIMEOUT_MS);
+
+  try {
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(eventForSheets),
+      signal: controller.signal,
+    });
+
+    const raw = await res.text();
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      data = { ok: false, error: "invalid_json_from_gas", raw };
+    }
+
+    return {
+      ok: Boolean(data?.ok),
+      status: res.status,
+      latency_ms: Date.now() - t0,
+      data,
+    };
+  } catch (err) {
+    const isAbort = String(err?.name || "").toLowerCase().includes("abort");
+    return {
+      ok: false,
+      error: isAbort ? "gas_timeout" : String(err?.message || err),
+      latency_ms: Date.now() - t0,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// ------------------------------
+// Line 2: INGEST (order intake)
+// + Line 3-A: Forward to Sheets (GAS Web App)
+// ------------------------------
+app.post("/ingest", express.json({ limit: "2mb" }), async (req, res) => {
+  const start = Date.now();
+  const traceId = req.headers["x-request-id"] || crypto.randomUUID();
+
+  try {
+    const { source, event_type, payload } = req.body || {};
+
+    if (!source || !event_type || !payload) {
+      const latency = Date.now() - start;
+      console.warn(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          level: "WARN",
+          line: "L2",
+          event: "ingest.reject",
+          trace_id: traceId,
+          ok: false,
+          error: "BAD_REQUEST",
+          latency_ms: latency,
+        })
+      );
+
+      return res.status(400).json({
+        ok: false,
+        error: "BAD_REQUEST",
+        detail: "source,event_type,payload are required",
+        trace_id: traceId,
+        mode: "v7.9-OPS-L2",
+      });
+    }
+
+    const jobId =
+      "job_" +
+      new Date().toISOString().replace(/[-:.TZ]/g, "") +
+      "_" +
+      crypto.randomBytes(3).toString("hex");
+
+    const latency = Date.now() - start;
+    const receivedAt = new Date().toISOString();
+
+    console.log(
+      JSON.stringify({
+        ts: receivedAt,
+        level: "INFO",
+        line: "L2",
+        event: "ingest.received",
+        trace_id: traceId,
+        source,
+        event_type,
+      })
+    );
+
+    console.log(
+      JSON.stringify({
+        ts: receivedAt,
+        level: "INFO",
+        line: "L2",
+        event: "ingest.ack",
+        trace_id: traceId,
+        job_id: jobId,
+        ok: true,
+        latency_ms: latency,
+      })
+    );
+
+    // -------- Line 3-A: best-effort forward to Sheets (DO NOT break ingest) --------
+    // Build payload for Sheets
+    const eventForSheets = {
+      job_id: jobId,
+      trace_id: traceId,
+      source,
+      event_type,
+      payload,
+      received_at: receivedAt,
+      ingest_latency_ms: latency,
+    };
+
+    // Try forward; regardless of result, /ingest stays 200 ok
+    try {
+      const sheets = await postToGASForSheets(eventForSheets);
+
+      if (sheets.ok) {
+        console.log(
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            level: "INFO",
+            line: "L3",
+            event: "sheets.append.ok",
+            trace_id: traceId,
+            job_id: jobId,
+            ok: true,
+            gas_status: sheets.status,
+            gas_latency_ms: sheets.latency_ms,
+            append_row: sheets.data?.append_row,
+          })
+        );
+      } else {
+        console.warn(
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            level: "WARN",
+            line: "L3",
+            event: "sheets.append.fail",
+            trace_id: traceId,
+            job_id: jobId,
+            ok: false,
+            gas_status: sheets.status,
+            gas_latency_ms: sheets.latency_ms,
+            error: sheets.error || sheets.data?.error,
+          })
+        );
+      }
+    } catch (e) {
+      // ultra-defensive: never crash ingest
+      console.warn(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          level: "WARN",
+          line: "L3",
+          event: "sheets.append.fail",
+          trace_id: traceId,
+          job_id: jobId,
+          ok: false,
+          error: e?.message || String(e),
+        })
+      );
+    }
+    // ---------------------------------------------------------------------------
+
+    return res.status(200).json({
+      ok: true,
+      job_id: jobId,
+      trace_id: traceId,
+      received_at: receivedAt,
+      latency_ms: latency,
+      mode: "v7.9-OPS-L2",
+    });
+  } catch (err) {
+    const latency = Date.now() - start;
+    console.error(
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        level: "ERROR",
+        line: "L2",
+        event: "ingest.fail",
+        trace_id: traceId,
+        ok: false,
+        error: err.message,
+        latency_ms: latency,
+      })
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error: "INTERNAL",
+      trace_id: traceId,
+      mode: "v7.9-OPS-L2",
+    });
+  }
+});
 
 // -----------------------
 // Stage C store (summary)
@@ -227,6 +353,11 @@ app.get("/health", (req, res) => {
     stored: store.length,
     store_limit: STORE_LIMIT,
     dedupe_window_ms: DEDUPE_WINDOW_MS,
+    line3a: {
+      gas_webapp_configured: Boolean(GAS_WEBAPP_URL),
+      secret_configured: Boolean(ITPLAYLAB_SECRET),
+      gas_timeout_ms: GAS_TIMEOUT_MS,
+    },
     queue: {
       length: queue.length,
       limit: QUEUE_LIMIT,
@@ -281,7 +412,9 @@ app.get("/sync/status", (req, res) => {
     dropped: queueDropped,
     synced: queueSynced,
     failed: queueFailed,
-    head: queue[0] ? { id: queue[0].id, retry: queue[0].retry, next_attempt_at: queue[0].next_attempt_at } : null,
+    head: queue[0]
+      ? { id: queue[0].id, retry: queue[0].retry, next_attempt_at: queue[0].next_attempt_at }
+      : null,
   });
 });
 
@@ -376,7 +509,7 @@ app.post("/events", (req, res) => {
 });
 
 // -----------------------
-// Google client (lazy)
+// Google client (lazy) - for /events worker sync only
 // -----------------------
 let googleClientCached = null;
 
@@ -410,7 +543,7 @@ async function getGoogleSheetsClient() {
 }
 
 // -----------------------
-// Worker (best-effort external sync)
+// Worker (best-effort external sync) - for /events queue only
 // -----------------------
 let workerTimer = null;
 let workerBusy = false;
@@ -488,8 +621,7 @@ async function workerTickOnce() {
   } catch (e) {
     // on failure: mark items with retry/backoff (do NOT throw to crash)
     const msg =
-      e?.response?.data ? JSON.stringify(e.response.data) :
-      e?.message || String(e);
+      e?.response?.data ? JSON.stringify(e.response.data) : e?.message || String(e);
 
     console.error("[sync-error]", msg);
 
