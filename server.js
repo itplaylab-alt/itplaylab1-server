@@ -28,9 +28,19 @@
 // Line 3-A (NEW):
 // - GAS_WEBAPP_URL (required for /ingest -> Sheets append)
 // - ITPLAYLAB_SECRET (shared secret; must match GAS Script Properties)
+//
+// Line 3-B (NEW):
+// - JSONL_FALLBACK=ON   (save to JSONL only when Sheets fails)
+// - JSONL_ALWAYS=ON     (always save to JSONL; audit / durable copy)
+// - JSONL_DIR=/var/data (recommended Render Disk mount path)
+// - JSONL_FILE=ingest_fallback.jsonl
+// - JSONL_MAX_BYTES=104857600 (rotate at 100MB)
+// - JSONL_TAIL_MAX_BYTES=2097152 (tail read cap 2MB)
 
 const express = require("express");
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 app.disable("x-powered-by");
@@ -64,6 +74,15 @@ const SA_JSON_PLAIN = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "";
 const GAS_WEBAPP_URL = process.env.GAS_WEBAPP_URL || "";
 const ITPLAYLAB_SECRET = process.env.ITPLAYLAB_SECRET || "";
 const GAS_TIMEOUT_MS = Number(process.env.GAS_TIMEOUT_MS || 2500);
+
+// Line 3-B JSONL fallback (durable on disk)
+const JSONL_FALLBACK = (process.env.JSONL_FALLBACK || "OFF").toUpperCase(); // OFF | ON
+const JSONL_ALWAYS = (process.env.JSONL_ALWAYS || "OFF").toUpperCase(); // OFF | ON
+const JSONL_DIR = process.env.JSONL_DIR || "/var/data";
+const JSONL_FILE = process.env.JSONL_FILE || "ingest_fallback.jsonl";
+const JSONL_MAX_BYTES = Number(process.env.JSONL_MAX_BYTES || 104857600); // 100MB
+const JSONL_TAIL_MAX_BYTES = Number(process.env.JSONL_TAIL_MAX_BYTES || 2097152); // 2MB
+const JSONL_ENABLED = JSONL_FALLBACK === "ON" || JSONL_ALWAYS === "ON";
 
 // Derived switches
 const STORE_ENABLED = OPS_MODE === "STORE" || OPS_MODE === "FULL";
@@ -143,9 +162,56 @@ async function postToGASForSheets(eventForSheets) {
   }
 }
 
+// ---- Line 3-B helper: JSONL (durable fallback) ----
+let jsonlWriteChain = Promise.resolve();
+
+function jsonlPath() {
+  return path.join(JSONL_DIR, JSONL_FILE);
+}
+
+async function ensureDirExists(dir) {
+  await fs.promises.mkdir(dir, { recursive: true });
+}
+
+async function rotateIfNeeded(filePath) {
+  try {
+    const st = await fs.promises.stat(filePath);
+    if (st.size < JSONL_MAX_BYTES) return;
+
+    const rotated = `${filePath}.${new Date().toISOString().replace(/[:.]/g, "-")}.bak`;
+    await fs.promises.rename(filePath, rotated);
+  } catch {
+    // file not found -> ignore
+  }
+}
+
+function appendJsonl(record) {
+  if (!JSONL_ENABLED) {
+    return Promise.resolve({ ok: false, skipped: true, reason: "jsonl_disabled" });
+  }
+
+  const filePath = jsonlPath();
+  const line = JSON.stringify(record) + "\n";
+
+  jsonlWriteChain = jsonlWriteChain
+    .then(async () => {
+      await ensureDirExists(JSONL_DIR);
+      await rotateIfNeeded(filePath);
+      await fs.promises.appendFile(filePath, line, "utf8");
+      return { ok: true };
+    })
+    .catch((err) => {
+      // keep chain alive
+      return { ok: false, error: String(err?.message || err) };
+    });
+
+  return jsonlWriteChain;
+}
+
 // ------------------------------
 // Line 2: INGEST (order intake)
 // + Line 3-A: Forward to Sheets (GAS Web App)
+// + Line 3-B: JSONL fallback (durable)
 // ------------------------------
 app.post("/ingest", express.json({ limit: "2mb" }), async (req, res) => {
   const start = Date.now();
@@ -212,8 +278,7 @@ app.post("/ingest", express.json({ limit: "2mb" }), async (req, res) => {
       })
     );
 
-    // -------- Line 3-A: best-effort forward to Sheets (DO NOT break ingest) --------
-    // Build payload for Sheets
+    // Build payload for Sheets + fallback
     const eventForSheets = {
       job_id: jobId,
       trace_id: traceId,
@@ -224,7 +289,45 @@ app.post("/ingest", express.json({ limit: "2mb" }), async (req, res) => {
       ingest_latency_ms: latency,
     };
 
-    // Try forward; regardless of result, /ingest stays 200 ok
+    // -------- Line 3-B (optional): always write JSONL --------
+    if (JSONL_ALWAYS === "ON") {
+      const r = await appendJsonl({
+        ts: new Date().toISOString(),
+        kind: "ingest",
+        stage: "jsonl.always",
+        ...eventForSheets,
+      });
+
+      if (!r.ok) {
+        console.warn(
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            level: "WARN",
+            line: "L3B",
+            event: "jsonl.append.fail",
+            trace_id: traceId,
+            job_id: jobId,
+            ok: false,
+            error: r.error,
+          })
+        );
+      } else {
+        console.log(
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            level: "INFO",
+            line: "L3B",
+            event: "jsonl.append.ok",
+            trace_id: traceId,
+            job_id: jobId,
+            ok: true,
+          })
+        );
+      }
+    }
+    // --------------------------------------------------------
+
+    // -------- Line 3-A: best-effort forward to Sheets (DO NOT break ingest) --------
     try {
       const sheets = await postToGASForSheets(eventForSheets);
 
@@ -258,6 +361,45 @@ app.post("/ingest", express.json({ limit: "2mb" }), async (req, res) => {
             error: sheets.error || sheets.data?.error,
           })
         );
+
+        // -------- Line 3-B: fallback on Sheets failure --------
+        if (JSONL_FALLBACK === "ON") {
+          const r = await appendJsonl({
+            ts: new Date().toISOString(),
+            kind: "ingest",
+            stage: "jsonl.fallback",
+            reason: sheets.error || sheets.data?.error || "sheets_fail",
+            ...eventForSheets,
+          });
+
+          if (!r.ok) {
+            console.warn(
+              JSON.stringify({
+                ts: new Date().toISOString(),
+                level: "WARN",
+                line: "L3B",
+                event: "jsonl.append.fail",
+                trace_id: traceId,
+                job_id: jobId,
+                ok: false,
+                error: r.error,
+              })
+            );
+          } else {
+            console.log(
+              JSON.stringify({
+                ts: new Date().toISOString(),
+                level: "INFO",
+                line: "L3B",
+                event: "jsonl.append.ok",
+                trace_id: traceId,
+                job_id: jobId,
+                ok: true,
+              })
+            );
+          }
+        }
+        // ----------------------------------------------------
       }
     } catch (e) {
       // ultra-defensive: never crash ingest
@@ -273,6 +415,44 @@ app.post("/ingest", express.json({ limit: "2mb" }), async (req, res) => {
           error: e?.message || String(e),
         })
       );
+
+      // fallback on exception
+      if (JSONL_FALLBACK === "ON") {
+        const r = await appendJsonl({
+          ts: new Date().toISOString(),
+          kind: "ingest",
+          stage: "jsonl.fallback",
+          reason: e?.message || String(e),
+          ...eventForSheets,
+        });
+
+        if (!r.ok) {
+          console.warn(
+            JSON.stringify({
+              ts: new Date().toISOString(),
+              level: "WARN",
+              line: "L3B",
+              event: "jsonl.append.fail",
+              trace_id: traceId,
+              job_id: jobId,
+              ok: false,
+              error: r.error,
+            })
+          );
+        } else {
+          console.log(
+            JSON.stringify({
+              ts: new Date().toISOString(),
+              level: "INFO",
+              line: "L3B",
+              event: "jsonl.append.ok",
+              trace_id: traceId,
+              job_id: jobId,
+              ok: true,
+            })
+          );
+        }
+      }
     }
     // ---------------------------------------------------------------------------
 
@@ -358,6 +538,14 @@ app.get("/health", (req, res) => {
       secret_configured: Boolean(ITPLAYLAB_SECRET),
       gas_timeout_ms: GAS_TIMEOUT_MS,
     },
+    line3b: {
+      jsonl_enabled: JSONL_ENABLED,
+      jsonl_fallback: JSONL_FALLBACK,
+      jsonl_always: JSONL_ALWAYS,
+      jsonl_dir: JSONL_DIR,
+      jsonl_file: JSONL_FILE,
+      jsonl_max_bytes: JSONL_MAX_BYTES,
+    },
     queue: {
       length: queue.length,
       limit: QUEUE_LIMIT,
@@ -373,6 +561,73 @@ app.get("/health", (req, res) => {
       backoff_base_ms: WORKER_BACKOFF_BASE_MS,
     },
   });
+});
+
+// -----------------------
+// Line 3-B: Fallback status/tail endpoints
+// -----------------------
+app.get("/fallback/status", async (req, res) => {
+  const p = jsonlPath();
+  try {
+    const st = await fs.promises.stat(p);
+    return res.status(200).json({
+      ok: true,
+      jsonl_enabled: JSONL_ENABLED,
+      jsonl_fallback: JSONL_FALLBACK,
+      jsonl_always: JSONL_ALWAYS,
+      path: p,
+      bytes: st.size,
+      updated_at: st.mtime.toISOString(),
+    });
+  } catch {
+    return res.status(200).json({
+      ok: true,
+      jsonl_enabled: JSONL_ENABLED,
+      jsonl_fallback: JSONL_FALLBACK,
+      jsonl_always: JSONL_ALWAYS,
+      path: p,
+      bytes: 0,
+      updated_at: null,
+      note: "file_not_found_yet",
+    });
+  }
+});
+
+app.get("/fallback/tail", async (req, res) => {
+  const n = Math.max(1, Math.min(Number(req.query.n || 50), 500));
+  const p = jsonlPath();
+
+  try {
+    const st = await fs.promises.stat(p);
+    const size = st.size;
+    const readSize = Math.min(size, JSONL_TAIL_MAX_BYTES);
+
+    const fd = await fs.promises.open(p, "r");
+    const buf = Buffer.alloc(readSize);
+    await fd.read(buf, 0, readSize, size - readSize);
+    await fd.close();
+
+    const text = buf.toString("utf8");
+    const lines = text
+      .trim()
+      .split("\n")
+      .slice(-n)
+      .map((l) => {
+        try {
+          return JSON.parse(l);
+        } catch {
+          return { raw: l };
+        }
+      });
+
+    return res.status(200).json({ ok: true, n, lines });
+  } catch (e) {
+    return res.status(200).json({
+      ok: false,
+      error: "no_file",
+      detail: String(e?.message || e),
+    });
+  }
 });
 
 // (옵션) 최근 저장 요약 확인 (STORE/FULL에서만)
@@ -478,7 +733,9 @@ app.post("/events", (req, res) => {
   // Stage D: enqueue for external sync (FULL only)
   if (OPS_MODE === "FULL") {
     try {
-      const id = crypto.randomUUID ? crypto.randomUUID() : `${now}-${receivedCount}-${Math.random().toString(16).slice(2)}`;
+      const id = crypto.randomUUID
+        ? crypto.randomUUID()
+        : `${now}-${receivedCount}-${Math.random().toString(16).slice(2)}`;
       enqueue({
         id,
         hash: hash || sha256(payloadStr),
@@ -521,7 +778,9 @@ function decodeServiceAccountJson() {
   if (SA_JSON_PLAIN) {
     return JSON.parse(SA_JSON_PLAIN);
   }
-  throw new Error("Missing service account JSON (GOOGLE_SERVICE_ACCOUNT_JSON_B64 or GOOGLE_SERVICE_ACCOUNT_JSON)");
+  throw new Error(
+    "Missing service account JSON (GOOGLE_SERVICE_ACCOUNT_JSON_B64 or GOOGLE_SERVICE_ACCOUNT_JSON)"
+  );
 }
 
 async function getGoogleSheetsClient() {
@@ -620,8 +879,7 @@ async function workerTickOnce() {
     return { synced: removed, remaining: queue.length };
   } catch (e) {
     // on failure: mark items with retry/backoff (do NOT throw to crash)
-    const msg =
-      e?.response?.data ? JSON.stringify(e.response.data) : e?.message || String(e);
+    const msg = e?.response?.data ? JSON.stringify(e.response.data) : e?.message || String(e);
 
     console.error("[sync-error]", msg);
 
@@ -700,7 +958,9 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(
-    `server listening on ${PORT} (mode=${MODE_TAG}, external=${WORKER_ENABLED ? "ON" : "OFF"}, store=${STORE_ENABLED ? "ON" : "OFF"})`
+    `server listening on ${PORT} (mode=${MODE_TAG}, external=${
+      WORKER_ENABLED ? "ON" : "OFF"
+    }, store=${STORE_ENABLED ? "ON" : "OFF"})`
   );
   startWorkerIfEnabled();
 });
