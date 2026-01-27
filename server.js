@@ -131,19 +131,27 @@ function cleanupMapByWindow(map, now, windowMs) {
   }
 }
 
+function buildGasUrl(baseUrl, secret) {
+  if (!baseUrl || !secret) return "";
+  const joiner = baseUrl.includes("?") ? "&" : "?";
+  return `${baseUrl}${joiner}__secret=${encodeURIComponent(secret)}`;
+}
+
+
 // ---- Line 3-A helper: POST to GAS (best-effort, timeout)
 async function postToGASForSheets(eventForSheets) {
   if (!GAS_WEBAPP_URL || !ITPLAYLAB_SECRET) {
     return { ok: false, error: "missing_GAS_WEBAPP_URL_or_ITPLAYLAB_SECRET" };
   }
 
-  const endpoint = `${GAS_WEBAPP_URL}?__secret=${encodeURIComponent(ITPLAYLAB_SECRET)}`;
+  const endpoint = buildGasUrl(GAS_WEBAPP_URL, ITPLAYLAB_SECRET);
   const t0 = Date.now();
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), GAS_TIMEOUT_MS);
 
   try {
+    console.log("[gas] POST", endpoint.replace(/__secret=([^&]+)/, "__secret=***"));
     const res = await fetch(endpoint, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -160,11 +168,13 @@ async function postToGASForSheets(eventForSheets) {
     }
 
     return {
-      ok: Boolean(data?.ok),
-      status: res.status,
-      latency_ms: Date.now() - t0,
-      data,
-    };
+  ok: Boolean(data?.ok),
+  status: res.status,
+  error: data?.error || (res.ok ? null : `http_${res.status}`),
+  latency_ms: Date.now() - t0,
+  data,
+};
+
   } catch (err) {
     const isAbort = String(err?.name || "").toLowerCase().includes("abort");
     return {
