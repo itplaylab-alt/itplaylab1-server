@@ -25,17 +25,25 @@
 // - WORKER_MAX_RETRY=5
 // - WORKER_BACKOFF_BASE_MS=2000
 //
-// Line 3-A (NEW):
+// Line 3-A:
 // - GAS_WEBAPP_URL (required for /ingest -> Sheets append)
 // - ITPLAYLAB_SECRET (shared secret; must match GAS Script Properties)
 //
-// Line 3-B (NEW):
+// Line 3-B (JSONL fallback):
 // - JSONL_FALLBACK=ON   (save to JSONL only when Sheets fails)
 // - JSONL_ALWAYS=ON     (always save to JSONL; audit / durable copy)
 // - JSONL_DIR=/var/data (recommended Render Disk mount path)
 // - JSONL_FILE=ingest_fallback.jsonl
 // - JSONL_MAX_BYTES=104857600 (rotate at 100MB)
 // - JSONL_TAIL_MAX_BYTES=2097152 (tail read cap 2MB)
+//
+// Line 3-C-lite (Replay worker: JSONL -> GAS):
+// - REPLAY_ENABLED=ON
+// - REPLAY_INTERVAL_MS=3000
+// - REPLAY_BATCH_SIZE=10
+// - REPLAY_MAX_BYTES_PER_TICK=1048576
+// - REPLAY_MODE=FALLBACK_ONLY | ALL
+// - REPLAY_STATE_FILE=replay_state.json
 
 const express = require("express");
 const crypto = require("crypto");
@@ -84,6 +92,14 @@ const JSONL_MAX_BYTES = Number(process.env.JSONL_MAX_BYTES || 104857600); // 100
 const JSONL_TAIL_MAX_BYTES = Number(process.env.JSONL_TAIL_MAX_BYTES || 2097152); // 2MB
 const JSONL_ENABLED = JSONL_FALLBACK === "ON" || JSONL_ALWAYS === "ON";
 
+// Line 3-C-lite replay worker
+const REPLAY_ENABLED = (process.env.REPLAY_ENABLED || "OFF").toUpperCase(); // OFF | ON
+const REPLAY_INTERVAL_MS = Number(process.env.REPLAY_INTERVAL_MS || 3000);
+const REPLAY_BATCH_SIZE = Number(process.env.REPLAY_BATCH_SIZE || 10);
+const REPLAY_MAX_BYTES_PER_TICK = Number(process.env.REPLAY_MAX_BYTES_PER_TICK || 1048576); // 1MB
+const REPLAY_MODE = (process.env.REPLAY_MODE || "FALLBACK_ONLY").toUpperCase(); // FALLBACK_ONLY | ALL
+const REPLAY_STATE_FILE = process.env.REPLAY_STATE_FILE || "replay_state.json";
+
 // Derived switches
 const STORE_ENABLED = OPS_MODE === "STORE" || OPS_MODE === "FULL";
 const WORKER_ENABLED = OPS_MODE === "FULL" && EXTERNAL_SYNC === "ON";
@@ -115,7 +131,7 @@ function cleanupMapByWindow(map, now, windowMs) {
   }
 }
 
-// ---- Line 3-A helper: POST to GAS (best-effort, timeout, never throws outward)
+// ---- Line 3-A helper: POST to GAS (best-effort, timeout)
 async function postToGASForSheets(eventForSheets) {
   if (!GAS_WEBAPP_URL || !ITPLAYLAB_SECRET) {
     return { ok: false, error: "missing_GAS_WEBAPP_URL_or_ITPLAYLAB_SECRET" };
@@ -124,7 +140,6 @@ async function postToGASForSheets(eventForSheets) {
   const endpoint = `${GAS_WEBAPP_URL}?__secret=${encodeURIComponent(ITPLAYLAB_SECRET)}`;
   const t0 = Date.now();
 
-  // Node 18+ fetch + AbortController
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), GAS_TIMEOUT_MS);
 
@@ -201,11 +216,211 @@ function appendJsonl(record) {
       return { ok: true };
     })
     .catch((err) => {
-      // keep chain alive
       return { ok: false, error: String(err?.message || err) };
     });
 
   return jsonlWriteChain;
+}
+
+// ---- Line 3-C-lite helper: replay state + read from offset ----
+function replayStatePath() {
+  return path.join(JSONL_DIR, REPLAY_STATE_FILE);
+}
+
+async function loadReplayState() {
+  const p = replayStatePath();
+  try {
+    const raw = await fs.promises.readFile(p, "utf8");
+    const st = JSON.parse(raw);
+    return {
+      offset: Number(st.offset || 0),
+      updated_at: st.updated_at || null,
+      last_error: st.last_error || null,
+      sent: Number(st.sent || 0),
+      failed: Number(st.failed || 0),
+    };
+  } catch {
+    return { offset: 0, updated_at: null, last_error: null, sent: 0, failed: 0 };
+  }
+}
+
+async function saveReplayState(state) {
+  await ensureDirExists(JSONL_DIR);
+  const p = replayStatePath();
+  const body = JSON.stringify(
+    {
+      offset: Number(state.offset || 0),
+      updated_at: new Date().toISOString(),
+      last_error: state.last_error || null,
+      sent: Number(state.sent || 0),
+      failed: Number(state.failed || 0),
+    },
+    null,
+    2
+  );
+  await fs.promises.writeFile(p, body, "utf8");
+}
+
+async function readJsonlFromOffset(filePath, offset, maxBytes) {
+  const st = await fs.promises.stat(filePath);
+  const size = st.size;
+  if (offset >= size) return { lines: [], newOffset: offset, eof: true };
+
+  const readSize = Math.min(maxBytes, size - offset);
+  const fd = await fs.promises.open(filePath, "r");
+  const buf = Buffer.alloc(readSize);
+  await fd.read(buf, 0, readSize, offset);
+  await fd.close();
+
+  const text = buf.toString("utf8");
+
+  const lastNewline = text.lastIndexOf("\n");
+  if (lastNewline < 0) {
+    return { lines: [], newOffset: offset, eof: false };
+  }
+
+  const complete = text.slice(0, lastNewline);
+  const rawLines = complete.split("\n").filter(Boolean);
+
+  const parsed = [];
+  for (const l of rawLines) {
+    try {
+      parsed.push(JSON.parse(l));
+    } catch {
+      // skip bad line
+    }
+  }
+
+  const bytesConsumed = Buffer.byteLength(text.slice(0, lastNewline + 1), "utf8");
+  return { lines: parsed, newOffset: offset + bytesConsumed, eof: false };
+}
+
+function shouldReplayRecord(rec) {
+  const stage = String(rec?.stage || "");
+  if (REPLAY_MODE === "ALL") return stage === "jsonl.always" || stage === "jsonl.fallback";
+  return stage === "jsonl.fallback";
+}
+
+// ---- Line 3-C-lite: replay worker ----
+let replayTimer = null;
+let replayBusy = false;
+let replayStats = {
+  ticks: 0,
+  sent: 0,
+  failed: 0,
+  last_tick_at: null,
+  last_error: null,
+};
+
+async function replayTickOnce() {
+  replayStats.ticks += 1;
+  replayStats.last_tick_at = new Date().toISOString();
+
+  if (!JSONL_ENABLED) return { ok: true, skipped: true, reason: "jsonl_disabled" };
+  if (REPLAY_ENABLED !== "ON") return { ok: true, skipped: true, reason: "replay_disabled" };
+  if (replayBusy) return { ok: true, skipped: true, reason: "replay_busy" };
+
+  replayBusy = true;
+
+  try {
+    const filePath = jsonlPath();
+
+    try {
+      await fs.promises.stat(filePath);
+    } catch {
+      return { ok: true, skipped: true, reason: "no_jsonl_file" };
+    }
+
+    const state = await loadReplayState();
+    const beforeOffset = state.offset;
+
+    const { lines, newOffset } = await readJsonlFromOffset(
+      filePath,
+      state.offset,
+      REPLAY_MAX_BYTES_PER_TICK
+    );
+
+    if (lines.length === 0) {
+      return { ok: true, sent: 0, advanced: 0, offset: state.offset };
+    }
+
+    const candidates = lines.filter(shouldReplayRecord).slice(0, REPLAY_BATCH_SIZE);
+
+    if (candidates.length === 0) {
+      state.offset = newOffset;
+      state.last_error = null;
+      await saveReplayState(state);
+      return {
+        ok: true,
+        sent: 0,
+        advanced: state.offset - beforeOffset,
+        offset: state.offset,
+        note: "no_replay_candidates",
+      };
+    }
+
+    // stop-on-first-failure (never advance offset on partial failure)
+    for (const rec of candidates) {
+      const eventForSheets = {
+        job_id: rec.job_id || "",
+        trace_id: rec.trace_id || "",
+        source: rec.source || "",
+        event_type: rec.event_type || "",
+        payload: rec.payload ?? {},
+        received_at: rec.received_at || rec.ts || new Date().toISOString(),
+        ingest_latency_ms: typeof rec.ingest_latency_ms === "number" ? rec.ingest_latency_ms : "",
+        replayed_at: new Date().toISOString(),
+      };
+
+      const r = await postToGASForSheets(eventForSheets);
+      if (!r.ok) {
+        replayStats.failed += 1;
+        replayStats.last_error = r.error || r.data?.error || "replay_send_fail";
+
+        state.last_error = replayStats.last_error;
+        state.failed = Number(state.failed || 0) + 1;
+        await saveReplayState(state);
+
+        return { ok: false, sent: 0, offset: state.offset, error: replayStats.last_error };
+      }
+
+      replayStats.sent += 1;
+      state.sent = Number(state.sent || 0) + 1;
+    }
+
+    state.offset = newOffset;
+    state.last_error = null;
+    await saveReplayState(state);
+
+    return {
+      ok: true,
+      sent: candidates.length,
+      advanced: state.offset - beforeOffset,
+      offset: state.offset,
+    };
+  } catch (e) {
+    const msg = e?.message || String(e);
+    replayStats.failed += 1;
+    replayStats.last_error = msg;
+    return { ok: false, error: msg };
+  } finally {
+    replayBusy = false;
+  }
+}
+
+function startReplayWorkerIfEnabled() {
+  if (REPLAY_ENABLED !== "ON") {
+    console.log(`[replay] disabled (REPLAY_ENABLED=${REPLAY_ENABLED})`);
+    return;
+  }
+  console.log(
+    `[replay] enabled interval=${REPLAY_INTERVAL_MS}ms batch=${REPLAY_BATCH_SIZE} mode=${REPLAY_MODE}`
+  );
+  replayTimer = setInterval(() => {
+    replayTickOnce().catch((e) => {
+      console.error("[replay-fatal]", e?.message || String(e));
+    });
+  }, REPLAY_INTERVAL_MS);
 }
 
 // ------------------------------
@@ -402,7 +617,6 @@ app.post("/ingest", express.json({ limit: "2mb" }), async (req, res) => {
         // ----------------------------------------------------
       }
     } catch (e) {
-      // ultra-defensive: never crash ingest
       console.warn(
         JSON.stringify({
           ts: new Date().toISOString(),
@@ -416,7 +630,6 @@ app.post("/ingest", express.json({ limit: "2mb" }), async (req, res) => {
         })
       );
 
-      // fallback on exception
       if (JSONL_FALLBACK === "ON") {
         const r = await appendJsonl({
           ts: new Date().toISOString(),
@@ -546,6 +759,16 @@ app.get("/health", (req, res) => {
       jsonl_file: JSONL_FILE,
       jsonl_max_bytes: JSONL_MAX_BYTES,
     },
+    line3c: {
+      replay_enabled: REPLAY_ENABLED === "ON",
+      replay_mode: REPLAY_MODE,
+      replay_interval_ms: REPLAY_INTERVAL_MS,
+      replay_batch_size: REPLAY_BATCH_SIZE,
+      replay_max_bytes_per_tick: REPLAY_MAX_BYTES_PER_TICK,
+      replay_state_file: REPLAY_STATE_FILE,
+      replay_busy: replayBusy,
+      replay_stats: replayStats,
+    },
     queue: {
       length: queue.length,
       limit: QUEUE_LIMIT,
@@ -628,6 +851,30 @@ app.get("/fallback/tail", async (req, res) => {
       detail: String(e?.message || e),
     });
   }
+});
+
+// -----------------------
+// Line 3-C-lite: Replay status/run endpoints
+// -----------------------
+app.get("/replay/status", async (req, res) => {
+  const state = await loadReplayState();
+  return res.status(200).json({
+    ok: true,
+    replay_enabled: REPLAY_ENABLED === "ON",
+    replay_mode: REPLAY_MODE,
+    replay_busy: replayBusy,
+    stats: replayStats,
+    state,
+    jsonl: {
+      enabled: JSONL_ENABLED,
+      path: jsonlPath(),
+    },
+  });
+});
+
+app.post("/replay/run", async (req, res) => {
+  const result = await replayTickOnce();
+  return res.status(200).json({ ok: true, ...result });
 });
 
 // (옵션) 최근 저장 요약 확인 (STORE/FULL에서만)
@@ -808,7 +1055,6 @@ let workerTimer = null;
 let workerBusy = false;
 
 function externalReadyCheck() {
-  // Only called when WORKER_ENABLED, but keep it defensive
   if (!SHEET_ID) return "SHEET_ID missing";
   if (!EVENTS_SHEET_NAME) return "EVENTS_SHEET_NAME missing";
   if (!SA_B64 && !SA_JSON_PLAIN) return "Service account JSON missing";
@@ -816,15 +1062,13 @@ function externalReadyCheck() {
 }
 
 async function appendBatchToSheet(items) {
-  // Convert queue items to rows
   // Columns: A event_id, B payload, C received_at, D source, E user_id
-  // For now, source/user_id are placeholders (extend later)
   const values = items.map((it) => [
     it.id,
-    it.payload_str, // payload as string
+    it.payload_str,
     it.received_at,
     "render",
-    "", // user_id (optional)
+    "",
   ]);
 
   const sheets = await getGoogleSheetsClient();
@@ -853,7 +1097,6 @@ async function workerTickOnce() {
   try {
     const now = Date.now();
 
-    // take up to batch size, but only those whose next_attempt_at <= now
     const candidates = [];
     for (const it of queue) {
       if (candidates.length >= WORKER_BATCH_SIZE) break;
@@ -864,10 +1107,8 @@ async function workerTickOnce() {
       return { synced: 0, skipped: queue.length, reason: "no_due_items" };
     }
 
-    // attempt append
     await appendBatchToSheet(candidates);
 
-    // on success: remove those items from queue (by id)
     const ids = new Set(candidates.map((c) => c.id));
     const before = queue.length;
     for (let i = queue.length - 1; i >= 0; i--) {
@@ -878,14 +1119,11 @@ async function workerTickOnce() {
 
     return { synced: removed, remaining: queue.length };
   } catch (e) {
-    // on failure: mark items with retry/backoff (do NOT throw to crash)
     const msg = e?.response?.data ? JSON.stringify(e.response.data) : e?.message || String(e);
-
     console.error("[sync-error]", msg);
 
     const now = Date.now();
 
-    // Apply backoff to earliest due items (up to batch size)
     let marked = 0;
     for (const it of queue) {
       if (marked >= WORKER_BATCH_SIZE) break;
@@ -895,7 +1133,6 @@ async function workerTickOnce() {
       it.last_error = msg;
 
       if (it.retry > WORKER_MAX_RETRY) {
-        // give up: remove from queue, count failed
         queueFailed += 1;
         const idx = queue.findIndex((x) => x.id === it.id);
         if (idx >= 0) queue.splice(idx, 1);
@@ -921,7 +1158,6 @@ function startWorkerIfEnabled() {
   workerTimer = setInterval(() => {
     workerTickOnce().catch((e) => {
       console.error("[worker-fatal]", e?.message || String(e));
-      // never crash the process
     });
   }, WORKER_INTERVAL_MS);
 }
@@ -958,9 +1194,10 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(
-    `server listening on ${PORT} (mode=${MODE_TAG}, external=${
-      WORKER_ENABLED ? "ON" : "OFF"
-    }, store=${STORE_ENABLED ? "ON" : "OFF"})`
+    `server listening on ${PORT} (mode=${MODE_TAG}, external=${WORKER_ENABLED ? "ON" : "OFF"}, store=${
+      STORE_ENABLED ? "ON" : "OFF"
+    })`
   );
   startWorkerIfEnabled();
+  startReplayWorkerIfEnabled();
 });
