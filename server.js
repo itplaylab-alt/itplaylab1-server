@@ -51,14 +51,21 @@ const fs = require("fs");
 const path = require("path");
 
 async function appendS0ToSheets({ traceId, receivedAtIso, source, eventType, latencyMs }) {
-  const url = process.env.SHEETS_INGEST_URL;
-  if (!url) return;
+  const base = process.env.SHEETS_INGEST_URL;
+  const secret = process.env.ITPLAYLAB_SECRET;
+  if (!base) return;
+
+  // 🔑 __secret URL 파라미터로 추가 (GAS 인증)
+  const u = new URL(base);
+  if (secret) u.searchParams.set("__secret", secret);
+  const url = u.toString();
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 2000);
+  // ⏱ GAS는 느릴 수 있으니 8초
+  const timeout = setTimeout(() => controller.abort(), 8000);
 
   try {
-    await fetch(url, {
+    const resp = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -73,14 +80,14 @@ async function appendS0ToSheets({ traceId, receivedAtIso, source, eventType, lat
       }),
       signal: controller.signal
     });
+
+    console.log("[S0->SHEETS] resp", { status: resp.status, traceId });
   } catch (e) {
     console.warn("[S0->SHEETS] write_error", String(e));
   } finally {
     clearTimeout(timeout);
   }
 }
-
-
 const app = express();
 // middleware
 app.use(express.json());
