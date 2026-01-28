@@ -88,15 +88,17 @@ app.use(express.json());
 // ✅ 여기부터 app 생성 이후
 app.post("/tg/webhook", (req, res) => {
   const t0 = Date.now();
-  const traceId = (crypto.randomUUID
-  ? crypto.randomUUID()
-  : crypto.randomBytes(16).toString("hex"));
 
+  const traceId = (crypto.randomUUID
+    ? crypto.randomUUID()
+    : crypto.randomBytes(16).toString("hex"));
+
+  const receivedAtIso = new Date().toISOString();
 
   // 1️⃣ Telegram에 즉시 응답 (입구 안정화)
   res.sendStatus(200);
 
-  // 2️⃣ S0 사실 로그 append (비동기)
+  // 2️⃣ S0 사실 로그 append (비동기, 응답과 분리)
   void appendS0ToSheets({
     traceId,
     receivedAtIso,
@@ -106,7 +108,11 @@ app.post("/tg/webhook", (req, res) => {
   });
 
   console.log("[TG WEBHOOK] received", { traceId });
+
+  // 3️⃣ 응답 종료 명시 (중복 응답 방지)
+  return;
 });
+
 
 
 // 기존 라우트
