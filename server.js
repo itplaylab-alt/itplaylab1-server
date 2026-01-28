@@ -66,7 +66,7 @@ app.get("/health", (req, res) => {
 });
 
 app.disable("x-powered-by");
-app.listen(process.env.PORT || 3000);
+
 
 // -----------------------
 // Config
