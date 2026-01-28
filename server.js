@@ -51,7 +51,22 @@ const fs = require("fs");
 const path = require("path");
 
 const app = express();
+// middleware
+app.use(express.json());
+
+// ✅ 여기부터 app 생성 이후
+app.post("/tg/webhook", (req, res) => {
+  console.log("[TG WEBHOOK] received");
+  res.sendStatus(200);
+});
+
+// 기존 라우트
+app.get("/health", (req, res) => {
+  res.send("ok");
+});
+
 app.disable("x-powered-by");
+app.listen(process.env.PORT || 3000);
 
 // -----------------------
 // Config
