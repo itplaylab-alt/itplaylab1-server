@@ -810,6 +810,10 @@ function enqueue(item) {
 // -----------------------
 // Health / Status endpoints
 // -----------------------
+app.get("/", (req, res) => {
+  res.status(200).send("ok");
+});
+
 app.get("/health", (req, res) => {
   res.status(200).json({
     ok: true,
