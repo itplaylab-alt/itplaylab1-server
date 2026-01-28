@@ -50,15 +50,64 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 
+async function appendS0ToSheets({ traceId, receivedAtIso, source, eventType, latencyMs }) {
+  const url = process.env.SHEETS_INGEST_URL;
+  if (!url) return;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 2000);
+
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        received_at: receivedAtIso,
+        job_id: "tg_ingest",
+        trace_id: traceId,
+        source,
+        event_type: eventType,
+        ingest_latency_ms: latencyMs,
+        payload_json: {},
+        gas_ok: true
+      }),
+      signal: controller.signal
+    });
+  } catch (e) {
+    console.warn("[S0->SHEETS] write_error", String(e));
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+
 const app = express();
 // middleware
 app.use(express.json());
 
 // ✅ 여기부터 app 생성 이후
 app.post("/tg/webhook", (req, res) => {
-  console.log("[TG WEBHOOK] received");
+  const t0 = Date.now();
+  const traceId = (crypto.randomUUID
+  ? crypto.randomUUID()
+  : crypto.randomBytes(16).toString("hex"));
+
+
+  // 1️⃣ Telegram에 즉시 응답 (입구 안정화)
   res.sendStatus(200);
+
+  // 2️⃣ S0 사실 로그 append (비동기)
+  void appendS0ToSheets({
+    traceId,
+    receivedAtIso,
+    source: "telegram",
+    eventType: "ingest.received",
+    latencyMs: Date.now() - t0
+  });
+
+  console.log("[TG WEBHOOK] received", { traceId });
 });
+
 
 // 기존 라우트
 app.get("/health", (req, res) => {
