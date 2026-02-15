@@ -1,134 +1,14 @@
 // v7.8-OPS-FULL:SAFE-SYNC (LOCK-CANDIDATE)
-// External sync is OFF by default. Queue + worker does best-effort syncing.
-// /events NEVER fails because of external systems.
-//
-// Modes:
-// - OPS_MODE=ECHO  : Stage B (echo-only)
-// - OPS_MODE=STORE : Stage C (store-only)
-// - OPS_MODE=FULL  : Stage D (store + optional external sync via queue/worker)
-//
-// External switch:
-// - EXTERNAL_SYNC=ON to enable worker (ONLY if OPS_MODE=FULL)
-// - default OFF (safe)
-//
-// Env (Google):
-// - SHEET_ID (required for sync)
-// - EVENTS_SHEET_NAME (default: events)
-// - GOOGLE_SERVICE_ACCOUNT_JSON_B64 (preferred) OR GOOGLE_SERVICE_ACCOUNT_JSON (plain)
-// Optional tuning:
-// - JSON_LIMIT=2mb
-// - STORE_LIMIT=200
-// - DEDUPE_WINDOW_MS=2000
-// - QUEUE_LIMIT=500
-// - WORKER_INTERVAL_MS=1500
-// - WORKER_BATCH_SIZE=5
-// - WORKER_MAX_RETRY=5
-// - WORKER_BACKOFF_BASE_MS=2000
-//
-// Line 3-A:
-// - GAS_WEBAPP_URL (required for /ingest -> Sheets append)
-// - ITPLAYLAB_SECRET (shared secret; must match GAS Script Properties)
-//
-// Line 3-B (JSONL fallback):
-// - JSONL_FALLBACK=ON   (save to JSONL only when Sheets fails)
-// - JSONL_ALWAYS=ON     (always save to JSONL; audit / durable copy)
-// - JSONL_DIR=/var/data (recommended Render Disk mount path)
-// - JSONL_FILE=ingest_fallback.jsonl
-// - JSONL_MAX_BYTES=104857600 (rotate at 100MB)
-// - JSONL_TAIL_MAX_BYTES=2097152 (tail read cap 2MB)
-//
-// Line 3-C-lite (Replay worker: JSONL -> GAS):
-// - REPLAY_ENABLED=ON
-// - REPLAY_INTERVAL_MS=3000
-// - REPLAY_BATCH_SIZE=10
-// - REPLAY_MAX_BYTES_PER_TICK=1048576
-// - REPLAY_MODE=FALLBACK_ONLY | ALL
-// - REPLAY_STATE_FILE=replay_state.json
+// Goal (short-term): Stabilize intake loop (TG -> ingest -> GAS/Sheets) with best-effort sync + fallback.
+// Notes:
+// - /tg/webhook must ACK fast (200) and push real payload into the same ingest pipeline.
+// - Remove confusing duplicates (/health, double json parser).
+// - Prefer GAS_WEBAPP_URL + ITPLAYLAB_SECRET. (Keep SHEETS_INGEST_URL as fallback alias for compatibility.)
 
 const express = require("express");
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
-
-async function appendS0ToSheets({ traceId, receivedAtIso, source, eventType, latencyMs }) {
-  const base = process.env.SHEETS_INGEST_URL;
-  const secret = process.env.ITPLAYLAB_SECRET;
-  if (!base) return;
-
-  // 🔑 __secret URL 파라미터로 추가 (GAS 인증)
-  const u = new URL(base);
-  if (secret) u.searchParams.set("__secret", secret);
-  const url = u.toString();
-
-  const controller = new AbortController();
-  // ⏱ GAS는 느릴 수 있으니 8초
-  const timeout = setTimeout(() => controller.abort(), 8000);
-
-  try {
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        received_at: receivedAtIso,
-        job_id: "tg_ingest",
-        trace_id: traceId,
-        source,
-        event_type: eventType,
-        ingest_latency_ms: latencyMs,
-        payload_json: {},
-        gas_ok: true
-      }),
-      signal: controller.signal
-    });
-
-    console.log("[S0->SHEETS] resp", { status: resp.status, traceId });
-  } catch (e) {
-    console.warn("[S0->SHEETS] write_error", String(e));
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-const app = express();
-// middleware
-app.use(express.json());
-
-// ✅ 여기부터 app 생성 이후
-app.post("/tg/webhook", (req, res) => {
-  const t0 = Date.now();
-
-  const traceId = (crypto.randomUUID
-    ? crypto.randomUUID()
-    : crypto.randomBytes(16).toString("hex"));
-
-  const receivedAtIso = new Date().toISOString();
-
-  // 1️⃣ Telegram에 즉시 응답 (입구 안정화)
-  res.sendStatus(200);
-
-  // 2️⃣ S0 사실 로그 append (비동기, 응답과 분리)
-  void appendS0ToSheets({
-    traceId,
-    receivedAtIso,
-    source: "telegram",
-    eventType: "ingest.received",
-    latencyMs: Date.now() - t0
-  });
-
-  console.log("[TG WEBHOOK] received", { traceId });
-
-  // 3️⃣ 응답 종료 명시 (중복 응답 방지)
-  return;
-});
-
-
-
-// 기존 라우트
-app.get("/health", (req, res) => {
-  res.send("ok");
-});
-
-app.disable("x-powered-by");
-
 
 // -----------------------
 // Config
@@ -158,7 +38,10 @@ const SA_JSON_PLAIN = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || "";
 // Line 3-A settings (/ingest -> GAS -> Sheets)
 const GAS_WEBAPP_URL = process.env.GAS_WEBAPP_URL || "";
 const ITPLAYLAB_SECRET = process.env.ITPLAYLAB_SECRET || "";
-const GAS_TIMEOUT_MS = Number(process.env.GAS_TIMEOUT_MS || 2500);
+const GAS_TIMEOUT_MS = Number(process.env.GAS_TIMEOUT_MS || process.env.GAS_TIMEOUT || 2500);
+
+// Back-compat alias (some deployments used SHEETS_INGEST_URL)
+const SHEETS_INGEST_URL = process.env.SHEETS_INGEST_URL || "";
 
 // Line 3-B JSONL fallback (durable on disk)
 const JSONL_FALLBACK = (process.env.JSONL_FALLBACK || "OFF").toUpperCase(); // OFF | ON
@@ -181,8 +64,11 @@ const REPLAY_STATE_FILE = process.env.REPLAY_STATE_FILE || "replay_state.json";
 const STORE_ENABLED = OPS_MODE === "STORE" || OPS_MODE === "FULL";
 const WORKER_ENABLED = OPS_MODE === "FULL" && EXTERNAL_SYNC === "ON";
 
+const app = express();
+app.disable("x-powered-by");
+
 // -----------------------
-// Body parser (global)
+// Body parser (single, global)
 // -----------------------
 app.use(
   express.json({
@@ -214,14 +100,15 @@ function buildGasUrl(baseUrl, secret) {
   return `${baseUrl}${joiner}__secret=${encodeURIComponent(secret)}`;
 }
 
-
 // ---- Line 3-A helper: POST to GAS (best-effort, timeout)
 async function postToGASForSheets(eventForSheets) {
-  if (!GAS_WEBAPP_URL || !ITPLAYLAB_SECRET) {
-    return { ok: false, error: "missing_GAS_WEBAPP_URL_or_ITPLAYLAB_SECRET" };
+  // Prefer GAS_WEBAPP_URL; fallback to SHEETS_INGEST_URL (back-compat)
+  const base = GAS_WEBAPP_URL || SHEETS_INGEST_URL;
+  if (!base || !ITPLAYLAB_SECRET) {
+    return { ok: false, error: "missing_GAS_WEBAPP_URL_or_SHEETS_INGEST_URL_or_ITPLAYLAB_SECRET" };
   }
 
-  const endpoint = buildGasUrl(GAS_WEBAPP_URL, ITPLAYLAB_SECRET);
+  const endpoint = buildGasUrl(base, ITPLAYLAB_SECRET);
   const t0 = Date.now();
 
   const controller = new AbortController();
@@ -229,6 +116,7 @@ async function postToGASForSheets(eventForSheets) {
 
   try {
     console.log("[gas] POST", endpoint.replace(/__secret=([^&]+)/, "__secret=***"));
+
     const res = await fetch(endpoint, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -245,13 +133,12 @@ async function postToGASForSheets(eventForSheets) {
     }
 
     return {
-  ok: Boolean(data?.ok),
-  status: res.status,
-  error: data?.error || (res.ok ? null : `http_${res.status}`),
-  latency_ms: Date.now() - t0,
-  data,
-};
-
+      ok: Boolean(data?.ok),
+      status: res.status,
+      error: data?.error || (res.ok ? null : `http_${res.status}`),
+      latency_ms: Date.now() - t0,
+      data,
+    };
   } catch (err) {
     const isAbort = String(err?.name || "").toLowerCase().includes("abort");
     return {
@@ -309,7 +196,478 @@ function appendJsonl(record) {
   return jsonlWriteChain;
 }
 
-// ---- Line 3-C-lite helper: replay state + read from offset ----
+// ------------------------------
+// Core ingest logic (shared)
+// ------------------------------
+function makeJobId() {
+  return (
+    "job_" +
+    new Date().toISOString().replace(/[-:.TZ]/g, "") +
+    "_" +
+    crypto.randomBytes(3).toString("hex")
+  );
+}
+
+/**
+ * Shared "best-effort" ingest pipeline:
+ * - builds eventForSheets
+ * - optional JSONL always
+ * - best-effort forward to GAS
+ * - optional JSONL fallback on failure
+ * Never throws outward (stability first).
+ */
+async function ingestInternal({ traceId, source, event_type, payload }) {
+  const start = Date.now();
+  const jobId = makeJobId();
+  const receivedAt = safeNowIso();
+
+  const eventForSheets = {
+    job_id: jobId,
+    trace_id: traceId,
+    source,
+    event_type,
+    payload,
+    received_at: receivedAt,
+    ingest_latency_ms: Date.now() - start,
+  };
+
+  // JSONL always
+  if (JSONL_ALWAYS === "ON") {
+    const r = await appendJsonl({
+      ts: safeNowIso(),
+      kind: "ingest",
+      stage: "jsonl.always",
+      ...eventForSheets,
+    });
+
+    if (!r.ok) {
+      console.warn(
+        JSON.stringify({
+          ts: safeNowIso(),
+          level: "WARN",
+          line: "L3B",
+          event: "jsonl.append.fail",
+          trace_id: traceId,
+          job_id: jobId,
+          ok: false,
+          error: r.error,
+        })
+      );
+    }
+  }
+
+  // Best-effort forward to GAS
+  const sheets = await postToGASForSheets(eventForSheets);
+
+  if (sheets.ok) {
+    console.log(
+      JSON.stringify({
+        ts: safeNowIso(),
+        level: "INFO",
+        line: "L3",
+        event: "sheets.append.ok",
+        trace_id: traceId,
+        job_id: jobId,
+        ok: true,
+        gas_status: sheets.status,
+        gas_latency_ms: sheets.latency_ms,
+        append_row: sheets.data?.append_row,
+      })
+    );
+    return { ok: true, job_id: jobId, trace_id: traceId, received_at: receivedAt, sheets };
+  }
+
+  console.warn(
+    JSON.stringify({
+      ts: safeNowIso(),
+      level: "WARN",
+      line: "L3",
+      event: "sheets.append.fail",
+      trace_id: traceId,
+      job_id: jobId,
+      ok: false,
+      gas_status: sheets.status,
+      gas_latency_ms: sheets.latency_ms,
+      error: sheets.error || sheets.data?.error,
+    })
+  );
+
+  // JSONL fallback on failure
+  if (JSONL_FALLBACK === "ON") {
+    const r = await appendJsonl({
+      ts: safeNowIso(),
+      kind: "ingest",
+      stage: "jsonl.fallback",
+      reason: sheets.error || sheets.data?.error || "sheets_fail",
+      ...eventForSheets,
+    });
+
+    if (!r.ok) {
+      console.warn(
+        JSON.stringify({
+          ts: safeNowIso(),
+          level: "WARN",
+          line: "L3B",
+          event: "jsonl.append.fail",
+          trace_id: traceId,
+          job_id: jobId,
+          ok: false,
+          error: r.error,
+        })
+      );
+    }
+  }
+
+  return { ok: false, job_id: jobId, trace_id: traceId, received_at: receivedAt, sheets };
+}
+
+// -----------------------
+// Telegram: webhook intake
+// -----------------------
+function parseTelegramUpdate(update) {
+  // Supports: message / channel_post / callback_query
+  const u = update || {};
+  const msg = u.message || u.channel_post || null;
+  const cb = u.callback_query || null;
+
+  const chat = msg?.chat || cb?.message?.chat || null;
+  const from = msg?.from || cb?.from || null;
+
+  const text =
+    msg?.text ??
+    msg?.caption ??
+    cb?.data ??
+    null;
+
+  const chatId = chat?.id ?? null;
+  const chatType = chat?.type ?? null; // private/group/supergroup/channel
+  const messageId = msg?.message_id ?? cb?.message?.message_id ?? null;
+
+  const fromId = from?.id ?? null;
+  const username = from?.username ?? null;
+
+  const updateType = u.message
+    ? "message"
+    : u.channel_post
+    ? "channel_post"
+    : u.callback_query
+    ? "callback_query"
+    : "unknown";
+
+  // command detection
+  let command = null;
+  if (typeof text === "string" && text.trim().startsWith("/")) {
+    command = text.trim().split(/\s+/)[0]; // "/start" "/run" ...
+  }
+
+  return {
+    update_id: u.update_id ?? null,
+    updateType,
+    chatId,
+    chatType,
+    messageId,
+    fromId,
+    username,
+    text,
+    command,
+  };
+}
+
+app.post("/tg/webhook", (req, res) => {
+  const t0 = Date.now();
+  const traceId =
+    req.headers["x-request-id"] ||
+    (crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex"));
+
+  // 1) ACK fast (stability)
+  res.sendStatus(200);
+
+  // 2) Build payload (minimal, safe) and push into ingest pipeline
+  const parsed = parseTelegramUpdate(req.body);
+
+  const event_type = parsed.command ? "tg.command" : "tg.message";
+
+  const payload = {
+    received_at: safeNowIso(),
+    trace_id: traceId,
+    telegram: {
+      ...parsed,
+      // Keep raw update OPTIONAL (can be big / sensitive). Default OFF for stability & privacy.
+      // raw_update: req.body,
+    },
+  };
+
+  // fire-and-forget (never block webhook)
+  void ingestInternal({
+    traceId,
+    source: "telegram",
+    event_type,
+    payload,
+  });
+
+  console.log("[TG WEBHOOK] ack", {
+    traceId,
+    ms: Date.now() - t0,
+    updateType: parsed.updateType,
+    chatType: parsed.chatType,
+    command: parsed.command || null,
+  });
+
+  return;
+});
+
+// ------------------------------
+// Line 2: INGEST (order intake)
+// ------------------------------
+app.post("/ingest", async (req, res) => {
+  const start = Date.now();
+  const traceId = req.headers["x-request-id"] || (crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex"));
+
+  try {
+    const { source, event_type, payload } = req.body || {};
+
+    if (!source || !event_type || payload == null) {
+      const latency = Date.now() - start;
+      console.warn(
+        JSON.stringify({
+          ts: safeNowIso(),
+          level: "WARN",
+          line: "L2",
+          event: "ingest.reject",
+          trace_id: traceId,
+          ok: false,
+          error: "BAD_REQUEST",
+          latency_ms: latency,
+        })
+      );
+
+      return res.status(400).json({
+        ok: false,
+        error: "BAD_REQUEST",
+        detail: "source,event_type,payload are required",
+        trace_id: traceId,
+        mode: "v7.9-OPS-L2",
+      });
+    }
+
+    console.log(
+      JSON.stringify({
+        ts: safeNowIso(),
+        level: "INFO",
+        line: "L2",
+        event: "ingest.received",
+        trace_id: traceId,
+        source,
+        event_type,
+      })
+    );
+
+    const result = await ingestInternal({ traceId, source, event_type, payload });
+
+    return res.status(200).json({
+      ok: true,
+      job_id: result.job_id,
+      trace_id: traceId,
+      received_at: result.received_at,
+      latency_ms: Date.now() - start,
+      mode: "v7.9-OPS-L2",
+      sheets_ok: Boolean(result.sheets?.ok),
+      sheets_error: result.sheets?.ok ? null : (result.sheets?.error || result.sheets?.data?.error || null),
+    });
+  } catch (err) {
+    const latency = Date.now() - start;
+    console.error(
+      JSON.stringify({
+        ts: safeNowIso(),
+        level: "ERROR",
+        line: "L2",
+        event: "ingest.fail",
+        trace_id: traceId,
+        ok: false,
+        error: err?.message || String(err),
+        latency_ms: latency,
+      })
+    );
+
+    return res.status(500).json({
+      ok: false,
+      error: "INTERNAL",
+      trace_id: traceId,
+      mode: "v7.9-OPS-L2",
+    });
+  }
+});
+
+// -----------------------
+// Stage C store (summary)
+// -----------------------
+const store = []; // { ts, hash, bytes, duplicate }
+const recentHashes = new Map(); // hash -> ts
+
+function addToStoreSummary({ ts, hash, bytes, duplicate }) {
+  store.push({ ts, hash, bytes, duplicate });
+  if (store.length > STORE_LIMIT) store.shift();
+}
+
+// -----------------------
+// Stage D queue for external sync (full payload)
+// -----------------------
+/**
+ * Queue item contains enough data to sync later:
+ * { id, hash, bytes, received_at, payload_str, retry, last_error, next_attempt_at }
+ */
+const queue = [];
+let queueDropped = 0;
+let queueSynced = 0;
+let queueFailed = 0;
+
+function enqueue(item) {
+  // drop-oldest policy (never throw)
+  if (queue.length >= QUEUE_LIMIT) {
+    queue.shift();
+    queueDropped += 1;
+  }
+  queue.push(item);
+}
+
+// -----------------------
+// Health / Status endpoints
+// -----------------------
+app.get("/", (req, res) => {
+  res.status(200).send("ok");
+});
+
+// ✅ keep only ONE /health (JSON)
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: "itplaylab-events-ingest",
+    mode: MODE_TAG,
+    external: WORKER_ENABLED ? "ON" : "OFF",
+    store_enabled: STORE_ENABLED,
+    stored: store.length,
+    store_limit: STORE_LIMIT,
+    dedupe_window_ms: DEDUPE_WINDOW_MS,
+    line3a: {
+      gas_webapp_configured: Boolean(GAS_WEBAPP_URL || SHEETS_INGEST_URL),
+      secret_configured: Boolean(ITPLAYLAB_SECRET),
+      gas_timeout_ms: GAS_TIMEOUT_MS,
+    },
+    line3b: {
+      jsonl_enabled: JSONL_ENABLED,
+      jsonl_fallback: JSONL_FALLBACK,
+      jsonl_always: JSONL_ALWAYS,
+      jsonl_dir: JSONL_DIR,
+      jsonl_file: JSONL_FILE,
+      jsonl_max_bytes: JSONL_MAX_BYTES,
+    },
+    line3c: {
+      replay_enabled: REPLAY_ENABLED === "ON",
+      replay_mode: REPLAY_MODE,
+      replay_interval_ms: REPLAY_INTERVAL_MS,
+      replay_batch_size: REPLAY_BATCH_SIZE,
+      replay_max_bytes_per_tick: REPLAY_MAX_BYTES_PER_TICK,
+      replay_state_file: REPLAY_STATE_FILE,
+      replay_busy: replayBusy,
+      replay_stats: replayStats,
+    },
+    queue: {
+      length: queue.length,
+      limit: QUEUE_LIMIT,
+      dropped: queueDropped,
+      synced: queueSynced,
+      failed: queueFailed,
+    },
+    worker: {
+      enabled: WORKER_ENABLED,
+      interval_ms: WORKER_INTERVAL_MS,
+      batch_size: WORKER_BATCH_SIZE,
+      max_retry: WORKER_MAX_RETRY,
+      backoff_base_ms: WORKER_BACKOFF_BASE_MS,
+    },
+  });
+});
+
+// -----------------------
+// Line 3-B: Fallback status/tail endpoints
+// -----------------------
+app.get("/fallback/status", async (req, res) => {
+  const p = jsonlPath();
+  try {
+    const st = await fs.promises.stat(p);
+    return res.status(200).json({
+      ok: true,
+      jsonl_enabled: JSONL_ENABLED,
+      jsonl_fallback: JSONL_FALLBACK,
+      jsonl_always: JSONL_ALWAYS,
+      path: p,
+      bytes: st.size,
+      updated_at: st.mtime.toISOString(),
+    });
+  } catch {
+    return res.status(200).json({
+      ok: true,
+      jsonl_enabled: JSONL_ENABLED,
+      jsonl_fallback: JSONL_FALLBACK,
+      jsonl_always: JSONL_ALWAYS,
+      path: p,
+      bytes: 0,
+      updated_at: null,
+      note: "file_not_found_yet",
+    });
+  }
+});
+
+app.get("/fallback/tail", async (req, res) => {
+  const n = Math.max(1, Math.min(Number(req.query.n || 50), 500));
+  const p = jsonlPath();
+
+  try {
+    const st = await fs.promises.stat(p);
+    const size = st.size;
+    const readSize = Math.min(size, JSONL_TAIL_MAX_BYTES);
+
+    const fd = await fs.promises.open(p, "r");
+    const buf = Buffer.alloc(readSize);
+    await fd.read(buf, 0, readSize, size - readSize);
+    await fd.close();
+
+    const text = buf.toString("utf8");
+    const lines = text
+      .trim()
+      .split("\n")
+      .slice(-n)
+      .map((l) => {
+        try {
+          return JSON.parse(l);
+        } catch {
+          return { raw: l };
+        }
+      });
+
+    return res.status(200).json({ ok: true, n, lines });
+  } catch (e) {
+    return res.status(200).json({
+      ok: false,
+      error: "no_file",
+      detail: String(e?.message || e),
+    });
+  }
+});
+
+// -----------------------
+// Line 3-C-lite: Replay status/run endpoints
+// -----------------------
+let replayTimer = null;
+let replayBusy = false;
+let replayStats = {
+  ticks: 0,
+  sent: 0,
+  failed: 0,
+  last_tick_at: null,
+  last_error: null,
+};
+
 function replayStatePath() {
   return path.join(JSONL_DIR, REPLAY_STATE_FILE);
 }
@@ -387,17 +745,6 @@ function shouldReplayRecord(rec) {
   if (REPLAY_MODE === "ALL") return stage === "jsonl.always" || stage === "jsonl.fallback";
   return stage === "jsonl.fallback";
 }
-
-// ---- Line 3-C-lite: replay worker ----
-let replayTimer = null;
-let replayBusy = false;
-let replayStats = {
-  ticks: 0,
-  sent: 0,
-  failed: 0,
-  last_tick_at: null,
-  last_error: null,
-};
 
 async function replayTickOnce() {
   replayStats.ticks += 1;
@@ -510,443 +857,6 @@ function startReplayWorkerIfEnabled() {
   }, REPLAY_INTERVAL_MS);
 }
 
-// ------------------------------
-// Line 2: INGEST (order intake)
-// + Line 3-A: Forward to Sheets (GAS Web App)
-// + Line 3-B: JSONL fallback (durable)
-// ------------------------------
-app.post("/ingest", express.json({ limit: "2mb" }), async (req, res) => {
-  const start = Date.now();
-  const traceId = req.headers["x-request-id"] || crypto.randomUUID();
-
-  try {
-    const { source, event_type, payload } = req.body || {};
-
-    if (!source || !event_type || !payload) {
-      const latency = Date.now() - start;
-      console.warn(
-        JSON.stringify({
-          ts: new Date().toISOString(),
-          level: "WARN",
-          line: "L2",
-          event: "ingest.reject",
-          trace_id: traceId,
-          ok: false,
-          error: "BAD_REQUEST",
-          latency_ms: latency,
-        })
-      );
-
-      return res.status(400).json({
-        ok: false,
-        error: "BAD_REQUEST",
-        detail: "source,event_type,payload are required",
-        trace_id: traceId,
-        mode: "v7.9-OPS-L2",
-      });
-    }
-
-    const jobId =
-      "job_" +
-      new Date().toISOString().replace(/[-:.TZ]/g, "") +
-      "_" +
-      crypto.randomBytes(3).toString("hex");
-
-    const latency = Date.now() - start;
-    const receivedAt = new Date().toISOString();
-
-    console.log(
-      JSON.stringify({
-        ts: receivedAt,
-        level: "INFO",
-        line: "L2",
-        event: "ingest.received",
-        trace_id: traceId,
-        source,
-        event_type,
-      })
-    );
-
-    console.log(
-      JSON.stringify({
-        ts: receivedAt,
-        level: "INFO",
-        line: "L2",
-        event: "ingest.ack",
-        trace_id: traceId,
-        job_id: jobId,
-        ok: true,
-        latency_ms: latency,
-      })
-    );
-
-    // Build payload for Sheets + fallback
-    const eventForSheets = {
-      job_id: jobId,
-      trace_id: traceId,
-      source,
-      event_type,
-      payload,
-      received_at: receivedAt,
-      ingest_latency_ms: latency,
-    };
-
-    // -------- Line 3-B (optional): always write JSONL --------
-    if (JSONL_ALWAYS === "ON") {
-      const r = await appendJsonl({
-        ts: new Date().toISOString(),
-        kind: "ingest",
-        stage: "jsonl.always",
-        ...eventForSheets,
-      });
-
-      if (!r.ok) {
-        console.warn(
-          JSON.stringify({
-            ts: new Date().toISOString(),
-            level: "WARN",
-            line: "L3B",
-            event: "jsonl.append.fail",
-            trace_id: traceId,
-            job_id: jobId,
-            ok: false,
-            error: r.error,
-          })
-        );
-      } else {
-        console.log(
-          JSON.stringify({
-            ts: new Date().toISOString(),
-            level: "INFO",
-            line: "L3B",
-            event: "jsonl.append.ok",
-            trace_id: traceId,
-            job_id: jobId,
-            ok: true,
-          })
-        );
-      }
-    }
-    // --------------------------------------------------------
-
-    // -------- Line 3-A: best-effort forward to Sheets (DO NOT break ingest) --------
-    try {
-      const sheets = await postToGASForSheets(eventForSheets);
-
-      if (sheets.ok) {
-        console.log(
-          JSON.stringify({
-            ts: new Date().toISOString(),
-            level: "INFO",
-            line: "L3",
-            event: "sheets.append.ok",
-            trace_id: traceId,
-            job_id: jobId,
-            ok: true,
-            gas_status: sheets.status,
-            gas_latency_ms: sheets.latency_ms,
-            append_row: sheets.data?.append_row,
-          })
-        );
-      } else {
-        console.warn(
-          JSON.stringify({
-            ts: new Date().toISOString(),
-            level: "WARN",
-            line: "L3",
-            event: "sheets.append.fail",
-            trace_id: traceId,
-            job_id: jobId,
-            ok: false,
-            gas_status: sheets.status,
-            gas_latency_ms: sheets.latency_ms,
-            error: sheets.error || sheets.data?.error,
-          })
-        );
-
-        // -------- Line 3-B: fallback on Sheets failure --------
-        if (JSONL_FALLBACK === "ON") {
-          const r = await appendJsonl({
-            ts: new Date().toISOString(),
-            kind: "ingest",
-            stage: "jsonl.fallback",
-            reason: sheets.error || sheets.data?.error || "sheets_fail",
-            ...eventForSheets,
-          });
-
-          if (!r.ok) {
-            console.warn(
-              JSON.stringify({
-                ts: new Date().toISOString(),
-                level: "WARN",
-                line: "L3B",
-                event: "jsonl.append.fail",
-                trace_id: traceId,
-                job_id: jobId,
-                ok: false,
-                error: r.error,
-              })
-            );
-          } else {
-            console.log(
-              JSON.stringify({
-                ts: new Date().toISOString(),
-                level: "INFO",
-                line: "L3B",
-                event: "jsonl.append.ok",
-                trace_id: traceId,
-                job_id: jobId,
-                ok: true,
-              })
-            );
-          }
-        }
-        // ----------------------------------------------------
-      }
-    } catch (e) {
-      console.warn(
-        JSON.stringify({
-          ts: new Date().toISOString(),
-          level: "WARN",
-          line: "L3",
-          event: "sheets.append.fail",
-          trace_id: traceId,
-          job_id: jobId,
-          ok: false,
-          error: e?.message || String(e),
-        })
-      );
-
-      if (JSONL_FALLBACK === "ON") {
-        const r = await appendJsonl({
-          ts: new Date().toISOString(),
-          kind: "ingest",
-          stage: "jsonl.fallback",
-          reason: e?.message || String(e),
-          ...eventForSheets,
-        });
-
-        if (!r.ok) {
-          console.warn(
-            JSON.stringify({
-              ts: new Date().toISOString(),
-              level: "WARN",
-              line: "L3B",
-              event: "jsonl.append.fail",
-              trace_id: traceId,
-              job_id: jobId,
-              ok: false,
-              error: r.error,
-            })
-          );
-        } else {
-          console.log(
-            JSON.stringify({
-              ts: new Date().toISOString(),
-              level: "INFO",
-              line: "L3B",
-              event: "jsonl.append.ok",
-              trace_id: traceId,
-              job_id: jobId,
-              ok: true,
-            })
-          );
-        }
-      }
-    }
-    // ---------------------------------------------------------------------------
-
-    return res.status(200).json({
-      ok: true,
-      job_id: jobId,
-      trace_id: traceId,
-      received_at: receivedAt,
-      latency_ms: latency,
-      mode: "v7.9-OPS-L2",
-    });
-  } catch (err) {
-    const latency = Date.now() - start;
-    console.error(
-      JSON.stringify({
-        ts: new Date().toISOString(),
-        level: "ERROR",
-        line: "L2",
-        event: "ingest.fail",
-        trace_id: traceId,
-        ok: false,
-        error: err.message,
-        latency_ms: latency,
-      })
-    );
-
-    return res.status(500).json({
-      ok: false,
-      error: "INTERNAL",
-      trace_id: traceId,
-      mode: "v7.9-OPS-L2",
-    });
-  }
-});
-
-// -----------------------
-// Stage C store (summary)
-// -----------------------
-const store = []; // { ts, hash, bytes, duplicate }
-const recentHashes = new Map(); // hash -> ts
-
-function addToStoreSummary({ ts, hash, bytes, duplicate }) {
-  store.push({ ts, hash, bytes, duplicate });
-  if (store.length > STORE_LIMIT) store.shift();
-}
-
-// -----------------------
-// Stage D queue for external sync (full payload)
-// -----------------------
-/**
- * Queue item contains enough data to sync later:
- * { id, hash, bytes, received_at, payload_str, retry, last_error, next_attempt_at }
- */
-const queue = [];
-let queueDropped = 0;
-let queueSynced = 0;
-let queueFailed = 0;
-
-function enqueue(item) {
-  // drop-oldest policy (never throw)
-  if (queue.length >= QUEUE_LIMIT) {
-    queue.shift();
-    queueDropped += 1;
-  }
-  queue.push(item);
-}
-
-// -----------------------
-// Health / Status endpoints
-// -----------------------
-app.get("/", (req, res) => {
-  res.status(200).send("ok");
-});
-
-app.get("/health", (req, res) => {
-  res.status(200).json({
-    ok: true,
-    service: "itplaylab-events-ingest",
-    mode: MODE_TAG,
-    external: WORKER_ENABLED ? "ON" : "OFF",
-    store_enabled: STORE_ENABLED,
-    stored: store.length,
-    store_limit: STORE_LIMIT,
-    dedupe_window_ms: DEDUPE_WINDOW_MS,
-    line3a: {
-      gas_webapp_configured: Boolean(GAS_WEBAPP_URL),
-      secret_configured: Boolean(ITPLAYLAB_SECRET),
-      gas_timeout_ms: GAS_TIMEOUT_MS,
-    },
-    line3b: {
-      jsonl_enabled: JSONL_ENABLED,
-      jsonl_fallback: JSONL_FALLBACK,
-      jsonl_always: JSONL_ALWAYS,
-      jsonl_dir: JSONL_DIR,
-      jsonl_file: JSONL_FILE,
-      jsonl_max_bytes: JSONL_MAX_BYTES,
-    },
-    line3c: {
-      replay_enabled: REPLAY_ENABLED === "ON",
-      replay_mode: REPLAY_MODE,
-      replay_interval_ms: REPLAY_INTERVAL_MS,
-      replay_batch_size: REPLAY_BATCH_SIZE,
-      replay_max_bytes_per_tick: REPLAY_MAX_BYTES_PER_TICK,
-      replay_state_file: REPLAY_STATE_FILE,
-      replay_busy: replayBusy,
-      replay_stats: replayStats,
-    },
-    queue: {
-      length: queue.length,
-      limit: QUEUE_LIMIT,
-      dropped: queueDropped,
-      synced: queueSynced,
-      failed: queueFailed,
-    },
-    worker: {
-      enabled: WORKER_ENABLED,
-      interval_ms: WORKER_INTERVAL_MS,
-      batch_size: WORKER_BATCH_SIZE,
-      max_retry: WORKER_MAX_RETRY,
-      backoff_base_ms: WORKER_BACKOFF_BASE_MS,
-    },
-  });
-});
-
-// -----------------------
-// Line 3-B: Fallback status/tail endpoints
-// -----------------------
-app.get("/fallback/status", async (req, res) => {
-  const p = jsonlPath();
-  try {
-    const st = await fs.promises.stat(p);
-    return res.status(200).json({
-      ok: true,
-      jsonl_enabled: JSONL_ENABLED,
-      jsonl_fallback: JSONL_FALLBACK,
-      jsonl_always: JSONL_ALWAYS,
-      path: p,
-      bytes: st.size,
-      updated_at: st.mtime.toISOString(),
-    });
-  } catch {
-    return res.status(200).json({
-      ok: true,
-      jsonl_enabled: JSONL_ENABLED,
-      jsonl_fallback: JSONL_FALLBACK,
-      jsonl_always: JSONL_ALWAYS,
-      path: p,
-      bytes: 0,
-      updated_at: null,
-      note: "file_not_found_yet",
-    });
-  }
-});
-
-app.get("/fallback/tail", async (req, res) => {
-  const n = Math.max(1, Math.min(Number(req.query.n || 50), 500));
-  const p = jsonlPath();
-
-  try {
-    const st = await fs.promises.stat(p);
-    const size = st.size;
-    const readSize = Math.min(size, JSONL_TAIL_MAX_BYTES);
-
-    const fd = await fs.promises.open(p, "r");
-    const buf = Buffer.alloc(readSize);
-    await fd.read(buf, 0, readSize, size - readSize);
-    await fd.close();
-
-    const text = buf.toString("utf8");
-    const lines = text
-      .trim()
-      .split("\n")
-      .slice(-n)
-      .map((l) => {
-        try {
-          return JSON.parse(l);
-        } catch {
-          return { raw: l };
-        }
-      });
-
-    return res.status(200).json({ ok: true, n, lines });
-  } catch (e) {
-    return res.status(200).json({
-      ok: false,
-      error: "no_file",
-      detail: String(e?.message || e),
-    });
-  }
-});
-
-// -----------------------
-// Line 3-C-lite: Replay status/run endpoints
-// -----------------------
 app.get("/replay/status", async (req, res) => {
   const state = await loadReplayState();
   return res.status(200).json({
@@ -966,63 +876,6 @@ app.get("/replay/status", async (req, res) => {
 app.post("/replay/run", async (req, res) => {
   const result = await replayTickOnce();
   return res.status(200).json({ ok: true, ...result });
-});
-
-// (옵션) 최근 저장 요약 확인 (STORE/FULL에서만)
-app.get("/store/recent", (req, res) => {
-  if (!STORE_ENABLED) {
-    return res.status(404).json({
-      ok: false,
-      error: "NOT_FOUND",
-      detail: "Store is disabled in this mode",
-      mode: MODE_TAG,
-    });
-  }
-  return res.status(200).json({
-    ok: true,
-    mode: MODE_TAG,
-    stored: store.length,
-    recent: store.slice(-20),
-  });
-});
-
-// (옵션) 큐 상태 확인 (FULL에서만)
-app.get("/sync/status", (req, res) => {
-  if (OPS_MODE !== "FULL") {
-    return res.status(404).json({
-      ok: false,
-      error: "NOT_FOUND",
-      detail: "Sync is only available in FULL mode",
-      mode: MODE_TAG,
-    });
-  }
-  return res.status(200).json({
-    ok: true,
-    mode: MODE_TAG,
-    external: WORKER_ENABLED ? "ON" : "OFF",
-    queue_length: queue.length,
-    queue_limit: QUEUE_LIMIT,
-    dropped: queueDropped,
-    synced: queueSynced,
-    failed: queueFailed,
-    head: queue[0]
-      ? { id: queue[0].id, retry: queue[0].retry, next_attempt_at: queue[0].next_attempt_at }
-      : null,
-  });
-});
-
-// (옵션) 워커 1회 수동 실행 (FULL + external ON일 때만 실제 sync 시도)
-app.post("/sync/run", async (req, res) => {
-  if (!WORKER_ENABLED) {
-    return res.status(200).json({
-      ok: true,
-      mode: MODE_TAG,
-      external: "OFF",
-      detail: "Worker disabled (set OPS_MODE=FULL and EXTERNAL_SYNC=ON)",
-    });
-  }
-  const result = await workerTickOnce();
-  return res.status(200).json({ ok: true, mode: MODE_TAG, external: "ON", ...result });
 });
 
 // -----------------------
@@ -1154,13 +1007,7 @@ function externalReadyCheck() {
 
 async function appendBatchToSheet(items) {
   // Columns: A event_id, B payload, C received_at, D source, E user_id
-  const values = items.map((it) => [
-    it.id,
-    it.payload_str,
-    it.received_at,
-    "render",
-    "",
-  ]);
+  const values = items.map((it) => [it.id, it.payload_str, it.received_at, "render", ""]);
 
   const sheets = await getGoogleSheetsClient();
   const range = `${EVENTS_SHEET_NAME}!A:E`;
