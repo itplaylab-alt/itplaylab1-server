@@ -577,6 +577,19 @@ function enqueue(item) {
 }
 
 // -----------------------
+// Line 3-C-lite: Replay status/run endpoints
+// -----------------------
+let replayTimer = null;
+let replayBusy = false;
+let replayStats = {
+  ticks: 0,
+  sent: 0,
+  failed: 0,
+  last_tick_at: null,
+  last_error: null,
+};
+
+// -----------------------
 // Health / Status endpoints
 // -----------------------
 app.get("/", (req, res) => {
@@ -701,18 +714,6 @@ app.get("/fallback/tail", async (req, res) => {
   }
 });
 
-// -----------------------
-// Line 3-C-lite: Replay status/run endpoints
-// -----------------------
-let replayTimer = null;
-let replayBusy = false;
-let replayStats = {
-  ticks: 0,
-  sent: 0,
-  failed: 0,
-  last_tick_at: null,
-  last_error: null,
-};
 
 function replayStatePath() {
   return path.join(JSONL_DIR, REPLAY_STATE_FILE);
