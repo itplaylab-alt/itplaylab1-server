@@ -17,6 +17,12 @@ const OPS_MODE = process.env.OPS_MODE || "FULL"; // ECHO | STORE | FULL
 const EXTERNAL_SYNC = (process.env.EXTERNAL_SYNC || "OFF").toUpperCase(); // OFF | ON
 const MODE_TAG = `v7.8-OPS:${OPS_MODE}`;
 const JSON_LIMIT = process.env.JSON_LIMIT || "2mb";
+// KPI guard settings (Stage4 OPS)
+const DURATION_LOCK_S = Number(process.env.DURATION_LOCK_S || 30);          // 계약: 30s
+const LATENCY_THRESH_MS = Number(process.env.LATENCY_THRESH_MS || 300);    // 연속 초과 기준(빠른 버전)
+const LATENCY_CONSEC_N = Number(process.env.LATENCY_CONSEC_N || 3);
+const ALERT_COOLDOWN_MS = Number(process.env.ALERT_COOLDOWN_MS || 5 * 60 * 1000); // 5분
+
 
 // Store-only settings
 const STORE_LIMIT = Number(process.env.STORE_LIMIT || 200);
@@ -80,6 +86,9 @@ app.use(
 // -----------------------
 // Helpers
 // -----------------------
+// -----------------------
+// Helpers
+// -----------------------
 function safeNowIso() {
   return new Date().toISOString();
 }
@@ -98,6 +107,43 @@ function buildGasUrl(baseUrl, secret) {
   if (!baseUrl || !secret) return "";
   const joiner = baseUrl.includes("?") ? "&" : "?";
   return `${baseUrl}${joiner}__secret=${encodeURIComponent(secret)}`;
+}
+
+// -----------------------
+// Stage4 OPS: idempotency + alert state (FAST)
+// -----------------------
+// trace_id -> last seen timestamp
+const recentTraceIds = new Map(); // trace_id -> ts(ms)
+
+// alertKey -> last alert timestamp (cooldown)
+const alertLast = new Map(); // alertKey -> ts(ms)
+
+// latency consecutive counter
+let latencyConsec = 0;
+
+/**
+ * Emit alert with cooldown.
+ * For FAST ops: log to console (Render logs). Later replace with Telegram webhook if needed.
+ */
+function emitAlert(alertKey, payload) {
+  const now = Date.now();
+  const last = alertLast.get(alertKey) || 0;
+
+  if (now - last < ALERT_COOLDOWN_MS) {
+    return { sent: false, cooldown: true };
+  }
+  alertLast.set(alertKey, now);
+
+  console.warn(
+    JSON.stringify({
+      ts: safeNowIso(),
+      level: "WARN",
+      alert: alertKey,
+      ...payload,
+    })
+  );
+
+  return { sent: true, cooldown: false };
 }
 
 // ---- Line 3-A helper: POST to GAS (best-effort, timeout)
@@ -195,7 +241,6 @@ function appendJsonl(record) {
 
   return jsonlWriteChain;
 }
-
 // ------------------------------
 // Core ingest logic (shared)
 // ------------------------------
@@ -879,7 +924,7 @@ app.post("/replay/run", async (req, res) => {
 });
 
 // -----------------------
-// /events (ECHO / STORE / FULL)
+// /events (ECHO / STORE / FULL)  + Stage4 OPS Guard
 // -----------------------
 let receivedCount = 0;
 
@@ -904,21 +949,96 @@ app.post("/events", (req, res) => {
     });
   }
 
-  // Stage C/D: store summary + dedupe
+  // =========================
+  // Stage4 OPS Guard (FAST)
+  // - trace_id required
+  // - idempotency by trace_id within DEDUPE_WINDOW_MS
+  // - duration breach alert (> DURATION_LOCK_S)
+  // - latency consecutive breach alert (>= LATENCY_CONSEC_N)
+  // =========================
+  const traceId = body?.trace_id;
+
+  if (!traceId || typeof traceId !== "string") {
+    // 운영 계약: trace_id는 전 공정 통일 키
+    return res.status(400).json({
+      ok: false,
+      error: "trace_id_required",
+      mode: MODE_TAG,
+    });
+  }
+
+  // cleanup old traceIds
+  cleanupMapByWindow(recentTraceIds, now, DEDUPE_WINDOW_MS * 5);
+
+  // idempotency check
   let duplicate = false;
+  if (recentTraceIds.has(traceId)) {
+    const lastTs = recentTraceIds.get(traceId);
+    if (now - lastTs < DEDUPE_WINDOW_MS) duplicate = true;
+  }
+
+  if (duplicate) {
+    // ✅ 중복이면: store/queue 모두 스킵하고 즉시 ACK
+    return res.status(200).json({
+      ok: true,
+      mode: MODE_TAG,
+      received_count: receivedCount,
+      bytes,
+      store_enabled: STORE_ENABLED,
+      stored: store.length,                    // 증가 없음
+      duplicate: true,
+      queue_length: OPS_MODE === "FULL" ? queue.length : undefined, // 증가 없음
+      external: WORKER_ENABLED ? "ON" : "OFF",
+      trace_id: traceId,
+      dedupe_window_ms: DEDUPE_WINDOW_MS,
+    });
+  }
+
+  // mark seen
+  recentTraceIds.set(traceId, now);
+
+  // duration breach
+  const duration = body?.duration;
+  if (typeof duration === "number" && duration > DURATION_LOCK_S) {
+    emitAlert("duration_breach", {
+      trace_id: traceId,
+      duration,
+      lock_s: DURATION_LOCK_S,
+      mode: body?.mode || "unknown",
+    });
+  }
+
+  // latency consecutive breach
+  const latency_ms = body?.latency_ms;
+  if (typeof latency_ms === "number") {
+    if (latency_ms > LATENCY_THRESH_MS) {
+      latencyConsec += 1;
+      if (latencyConsec >= LATENCY_CONSEC_N) {
+        emitAlert("latency_consecutive_breach", {
+          trace_id: traceId,
+          latency_ms,
+          threshold_ms: LATENCY_THRESH_MS,
+          consecutive: latencyConsec,
+        });
+        latencyConsec = 0; // 한번 울리면 리셋(운영 취향)
+      }
+    } else {
+      latencyConsec = 0;
+    }
+  }
+
+  // -------------------------
+  // 기존 Stage C/D: store summary
+  // (기존 hash dedupe는 "참고값"으로만 유지할지 선택)
+  // 지금은 trace_id가 주 dedupe이므로, hash는 단순 기록용으로만 둠.
+  // -------------------------
   let hash = null;
 
   try {
     hash = sha256(payloadStr);
-    cleanupMapByWindow(recentHashes, now, DEDUPE_WINDOW_MS);
-
-    if (recentHashes.has(hash)) duplicate = true;
-    else recentHashes.set(hash, now);
-
-    addToStoreSummary({ ts: now, hash, bytes, duplicate });
+    addToStoreSummary({ ts: now, hash, bytes, duplicate: false });
   } catch (e) {
     console.error("[store-error]", e?.message || String(e));
-    // 저장 실패해도 응답은 정상
   }
 
   // Stage D: enqueue for external sync (FULL only)
@@ -927,19 +1047,19 @@ app.post("/events", (req, res) => {
       const id = crypto.randomUUID
         ? crypto.randomUUID()
         : `${now}-${receivedCount}-${Math.random().toString(16).slice(2)}`;
+
       enqueue({
         id,
         hash: hash || sha256(payloadStr),
         bytes,
         received_at: safeNowIso(),
-        payload_str: payloadStr, // FULL payload stored in queue for later sync
+        payload_str: payloadStr,
         retry: 0,
         last_error: null,
         next_attempt_at: 0,
       });
     } catch (e) {
       console.error("[enqueue-error]", e?.message || String(e));
-      // 큐 실패해도 응답은 정상
     }
   }
 
@@ -950,9 +1070,10 @@ app.post("/events", (req, res) => {
     bytes,
     store_enabled: STORE_ENABLED,
     stored: store.length,
-    duplicate,
+    duplicate: false,
     queue_length: OPS_MODE === "FULL" ? queue.length : undefined,
     external: WORKER_ENABLED ? "ON" : "OFF",
+    trace_id: traceId,
   });
 });
 
