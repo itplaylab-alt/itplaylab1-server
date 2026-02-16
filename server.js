@@ -22,7 +22,8 @@ const DURATION_LOCK_S = Number(process.env.DURATION_LOCK_S || 30);          // �
 const LATENCY_THRESH_MS = Number(process.env.LATENCY_THRESH_MS || 300);    // 연속 초과 기준(빠른 버전)
 const LATENCY_CONSEC_N = Number(process.env.LATENCY_CONSEC_N || 3);
 const ALERT_COOLDOWN_MS = Number(process.env.ALERT_COOLDOWN_MS || 5 * 60 * 1000); // 5분
-
+const STALE_TIMEOUT_MS = Number(process.env.STALE_TIMEOUT_MS || 20 * 60 * 1000); // 20분
+const TRACE_CACHE_LIMIT = Number(process.env.TRACE_CACHE_LIMIT || 50000);
 
 // Store-only settings
 const STORE_LIMIT = Number(process.env.STORE_LIMIT || 200);
@@ -967,35 +968,36 @@ app.post("/events", (req, res) => {
     });
   }
 
-  // cleanup old traceIds
-  cleanupMapByWindow(recentTraceIds, now, DEDUPE_WINDOW_MS * 5);
+ // cleanup old traceIds (Stage4 contract: stale_timeout)
+cleanupMapByWindow(recentTraceIds, now, STALE_TIMEOUT_MS);
 
-  // idempotency check
-  let duplicate = false;
-  if (recentTraceIds.has(traceId)) {
-    const lastTs = recentTraceIds.get(traceId);
-    if (now - lastTs < DEDUPE_WINDOW_MS) duplicate = true;
-  }
+// memory guard (FAST)
+if (recentTraceIds.size > TRACE_CACHE_LIMIT) {
+  recentTraceIds.clear();
+}
 
-  if (duplicate) {
-    // ✅ 중복이면: store/queue 모두 스킵하고 즉시 ACK
-    return res.status(200).json({
-      ok: true,
-      mode: MODE_TAG,
-      received_count: receivedCount,
-      bytes,
-      store_enabled: STORE_ENABLED,
-      stored: store.length,                    // 증가 없음
-      duplicate: true,
-      queue_length: OPS_MODE === "FULL" ? queue.length : undefined, // 증가 없음
-      external: WORKER_ENABLED ? "ON" : "OFF",
-      trace_id: traceId,
-      dedupe_window_ms: DEDUPE_WINDOW_MS,
-    });
-  }
+// idempotency check (strict by trace_id within stale_timeout)
+const duplicate = recentTraceIds.has(traceId);
 
-  // mark seen
-  recentTraceIds.set(traceId, now);
+if (duplicate) {
+  // ✅ 중복이면: store/queue 모두 스킵하고 즉시 ACK
+  return res.status(200).json({
+    ok: true,
+    mode: MODE_TAG,
+    received_count: receivedCount,
+    bytes,
+    store_enabled: STORE_ENABLED,
+    stored: store.length,
+    duplicate: true,
+    queue_length: OPS_MODE === "FULL" ? queue.length : undefined,
+    external: WORKER_ENABLED ? "ON" : "OFF",
+    trace_id: traceId,
+    stale_timeout_ms: STALE_TIMEOUT_MS,
+  });
+}
+
+// mark seen
+recentTraceIds.set(traceId, now);
 
   // duration breach
   const duration = body?.duration;
