@@ -10,6 +10,15 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 
+// 🔥 전역 크래시 추적 (Stage4 디버그용)
+process.on("uncaughtException", (err) => {
+  console.error("[uncaughtException]", err?.stack || err);
+});
+
+process.on("unhandledRejection", (err) => {
+  console.error("[unhandledRejection]", err?.stack || err);
+});
+
 // -----------------------
 // Config
 // -----------------------
@@ -592,59 +601,68 @@ let replayStats = {
 // -----------------------
 // Health / Status endpoints
 // -----------------------
-app.get("/", (req, res) => {
-  res.status(200).send("ok");
-});
-
-// ✅ keep only ONE /health (JSON)
 app.get("/health", (req, res) => {
-  res.status(200).json({
-    ok: true,
-    service: "itplaylab-events-ingest",
-    mode: MODE_TAG,
-    external: WORKER_ENABLED ? "ON" : "OFF",
-    store_enabled: STORE_ENABLED,
-    stored: store.length,
-    store_limit: STORE_LIMIT,
-    dedupe_window_ms: DEDUPE_WINDOW_MS,
-    line3a: {
-      gas_webapp_configured: Boolean(GAS_WEBAPP_URL || SHEETS_INGEST_URL),
-      secret_configured: Boolean(ITPLAYLAB_SECRET),
-      gas_timeout_ms: GAS_TIMEOUT_MS,
-    },
-    line3b: {
-      jsonl_enabled: JSONL_ENABLED,
-      jsonl_fallback: JSONL_FALLBACK,
-      jsonl_always: JSONL_ALWAYS,
-      jsonl_dir: JSONL_DIR,
-      jsonl_file: JSONL_FILE,
-      jsonl_max_bytes: JSONL_MAX_BYTES,
-    },
-    line3c: {
-      replay_enabled: REPLAY_ENABLED === "ON",
-      replay_mode: REPLAY_MODE,
-      replay_interval_ms: REPLAY_INTERVAL_MS,
-      replay_batch_size: REPLAY_BATCH_SIZE,
-      replay_max_bytes_per_tick: REPLAY_MAX_BYTES_PER_TICK,
-      replay_state_file: REPLAY_STATE_FILE,
-      replay_busy: replayBusy,
-      replay_stats: replayStats,
-    },
-    queue: {
-      length: queue.length,
-      limit: QUEUE_LIMIT,
-      dropped: queueDropped,
-      synced: queueSynced,
-      failed: queueFailed,
-    },
-    worker: {
-      enabled: WORKER_ENABLED,
-      interval_ms: WORKER_INTERVAL_MS,
-      batch_size: WORKER_BATCH_SIZE,
-      max_retry: WORKER_MAX_RETRY,
-      backoff_base_ms: WORKER_BACKOFF_BASE_MS,
-    },
-  });
+  try {
+    return res.status(200).json({
+      ok: true,
+      service: "itplaylab-events-ingest",
+      mode: MODE_TAG,
+      external: WORKER_ENABLED ? "ON" : "OFF",
+      store_enabled: STORE_ENABLED,
+      stored: store.length,
+      store_limit: STORE_LIMIT,
+      dedupe_window_ms: DEDUPE_WINDOW_MS,
+
+      line3a: {
+        gas_webapp_configured: Boolean(GAS_WEBAPP_URL || SHEETS_INGEST_URL),
+        secret_configured: Boolean(ITPLAYLAB_SECRET),
+        gas_timeout_ms: GAS_TIMEOUT_MS,
+      },
+
+      line3b: {
+        jsonl_enabled: JSONL_ENABLED,
+        jsonl_fallback: JSONL_FALLBACK,
+        jsonl_always: JSONL_ALWAYS,
+        jsonl_dir: JSONL_DIR,
+        jsonl_file: JSONL_FILE,
+        jsonl_max_bytes: JSONL_MAX_BYTES,
+      },
+
+      line3c: {
+        replay_enabled: REPLAY_ENABLED === "ON",
+        replay_mode: REPLAY_MODE,
+        replay_interval_ms: REPLAY_INTERVAL_MS,
+        replay_batch_size: REPLAY_BATCH_SIZE,
+        replay_max_bytes_per_tick: REPLAY_MAX_BYTES_PER_TICK,
+        replay_state_file: REPLAY_STATE_FILE,
+        replay_busy: replayBusy,
+        replay_stats: replayStats,
+      },
+
+      queue: {
+        length: queue.length,
+        limit: QUEUE_LIMIT,
+        dropped: queueDropped,
+        synced: queueSynced,
+        failed: queueFailed,
+      },
+
+      worker: {
+        enabled: WORKER_ENABLED,
+        interval_ms: WORKER_INTERVAL_MS,
+        batch_size: WORKER_BATCH_SIZE,
+        max_retry: WORKER_MAX_RETRY,
+        backoff_base_ms: WORKER_BACKOFF_BASE_MS,
+      },
+    });
+  } catch (e) {
+    console.error("[health-crash]", e?.stack || e?.message || String(e));
+    return res.status(500).json({
+      ok: false,
+      error: "HEALTH_CRASH",
+      detail: e?.message || String(e),
+    });
+  }
 });
 
 // -----------------------
